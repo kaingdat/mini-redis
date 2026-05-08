@@ -45,100 +45,109 @@ pub fn handle_command(
                 b"ERR wrong number of arguments for 'echo' command".to_vec(),
             ),
         },
-        b"SET" => {
-            if parts.len() != 3 && parts.len() != 5 {
-                return RedisValueRef::ErrorMsg(
-                    b"ERR wrong number of arguments for 'set' command".to_vec(),
-                );
-            }
-
-            let key = match parts.get(1) {
-                Some(RedisValueRef::BulkString(msg)) => msg.clone(),
-                _ => return RedisValueRef::ErrorMsg(b"ERR invalid key type".to_vec()),
-            };
-
-            let value = match parts.get(2) {
-                Some(RedisValueRef::BulkString(msg)) => msg.clone(),
-                _ => return RedisValueRef::ErrorMsg(b"ERR invalid value type".to_vec()),
-            };
-
-            let expires_at = if parts.len() == 5 {
-                let option = match parts.get(3) {
-                    Some(RedisValueRef::BulkString(opt)) => opt,
-                    _ => return RedisValueRef::ErrorMsg(b"ERR syntax error".to_vec()),
-                };
-
-                if option.to_ascii_uppercase().as_slice() != b"PX" {
-                    return RedisValueRef::ErrorMsg(b"ERR syntax error".to_vec());
-                }
-
-                let px_value = match parts.get(4) {
-                    Some(RedisValueRef::BulkString(val)) => match std::str::from_utf8(val) {
-                        Ok(s) => match s.parse::<i64>() {
-                            Ok(ms) if ms > 0 => ms,
-                            Ok(_) => {
-                                return RedisValueRef::ErrorMsg(
-                                    b"ERR invalid expire time in 'set' command".to_vec(),
-                                );
-                            }
-                            Err(_) => {
-                                return RedisValueRef::ErrorMsg(
-                                    b"ERR value is not integer or out of range".to_vec(),
-                                );
-                            }
-                        },
-                        Err(_) => {
-                            return RedisValueRef::ErrorMsg(
-                                b"ERR value is not integer or out of range".to_vec(),
-                            );
-                        }
-                    },
-                    _ => return RedisValueRef::ErrorMsg(b"ERR syntax error".to_vec()),
-                };
-
-                Some(Instant::now() + Duration::from_millis(px_value as u64))
-            } else {
-                None
-            };
-
-            storage.insert(key, ValueEntry::new(RedisValue::String(value), expires_at));
-
-            RedisValueRef::SimpleString(Bytes::from_static(b"OK"))
-        }
-        b"GET" => {
-            if parts.len() != 2 {
-                return RedisValueRef::ErrorMsg(
-                    b"ERR wrong number of arguments for 'get' command".to_vec(),
-                );
-            }
-
-            let key = match parts.get(1) {
-                Some(RedisValueRef::BulkString(key)) => key,
-                _ => return RedisValueRef::ErrorMsg(b"ERR invalid key type".to_vec()),
-            };
-
-            match storage.get(key) {
-                Some(entry) => {
-                    if entry.is_expired() {
-                        drop(entry);
-                        storage.remove(key);
-                        RedisValueRef::NullBulkString
-                    } else {
-                        match &entry.data {
-                            RedisValue::String(data) => RedisValueRef::BulkString(data.clone()),
-                            _ => RedisValueRef::ErrorMsg(
-                                b"WRONGTYPE Operation against a key holding wrong type value"
-                                    .to_vec(),
-                            ),
-                        }
-                    }
-                }
-                None => RedisValueRef::NullBulkString,
-            }
-        }
+        b"SET" => handle_set(&parts, storage),
+        b"GET" => handle_get(&parts, storage),
         b"ZADD" => handle_zadd(&parts, storage),
         _ => RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec()),
     }
+}
+
+fn handle_get(
+    parts: &[RedisValueRef],
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+) -> RedisValueRef {
+    if parts.len() != 2 {
+        return RedisValueRef::ErrorMsg(
+            b"ERR wrong number of arguments for 'get' command".to_vec(),
+        );
+    }
+
+    let key = match parts.get(1) {
+        Some(RedisValueRef::BulkString(key)) => key,
+        _ => return RedisValueRef::ErrorMsg(b"ERR invalid key type".to_vec()),
+    };
+
+    match storage.get(key) {
+        Some(entry) => {
+            if entry.is_expired() {
+                drop(entry);
+                storage.remove(key);
+                RedisValueRef::NullBulkString
+            } else {
+                match &entry.data {
+                    RedisValue::String(data) => RedisValueRef::BulkString(data.clone()),
+                    _ => RedisValueRef::ErrorMsg(
+                        b"WRONGTYPE Operation against a key holding wrong type value".to_vec(),
+                    ),
+                }
+            }
+        }
+        None => RedisValueRef::NullBulkString,
+    }
+}
+
+fn handle_set(
+    parts: &[RedisValueRef],
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+) -> RedisValueRef {
+    if parts.len() != 3 && parts.len() != 5 {
+        return RedisValueRef::ErrorMsg(
+            b"ERR wrong number of arguments for 'set' command".to_vec(),
+        );
+    }
+
+    let key = match parts.get(1) {
+        Some(RedisValueRef::BulkString(msg)) => msg.clone(),
+        _ => return RedisValueRef::ErrorMsg(b"ERR invalid key type".to_vec()),
+    };
+
+    let value = match parts.get(2) {
+        Some(RedisValueRef::BulkString(msg)) => msg.clone(),
+        _ => return RedisValueRef::ErrorMsg(b"ERR invalid value type".to_vec()),
+    };
+
+    let expires_at = if parts.len() == 5 {
+        let option = match parts.get(3) {
+            Some(RedisValueRef::BulkString(opt)) => opt,
+            _ => return RedisValueRef::ErrorMsg(b"ERR syntax error".to_vec()),
+        };
+
+        if option.to_ascii_uppercase().as_slice() != b"PX" {
+            return RedisValueRef::ErrorMsg(b"ERR syntax error".to_vec());
+        }
+
+        let px_value = match parts.get(4) {
+            Some(RedisValueRef::BulkString(val)) => match std::str::from_utf8(val) {
+                Ok(s) => match s.parse::<i64>() {
+                    Ok(ms) if ms > 0 => ms,
+                    Ok(_) => {
+                        return RedisValueRef::ErrorMsg(
+                            b"ERR invalid expire time in 'set' command".to_vec(),
+                        );
+                    }
+                    Err(_) => {
+                        return RedisValueRef::ErrorMsg(
+                            b"ERR value is not integer or out of range".to_vec(),
+                        );
+                    }
+                },
+                Err(_) => {
+                    return RedisValueRef::ErrorMsg(
+                        b"ERR value is not integer or out of range".to_vec(),
+                    );
+                }
+            },
+            _ => return RedisValueRef::ErrorMsg(b"ERR syntax error".to_vec()),
+        };
+
+        Some(Instant::now() + Duration::from_millis(px_value as u64))
+    } else {
+        None
+    };
+
+    storage.insert(key, ValueEntry::new(RedisValue::String(value), expires_at));
+
+    RedisValueRef::SimpleString(Bytes::from_static(b"OK"))
 }
 
 fn handle_zadd(
