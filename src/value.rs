@@ -52,6 +52,16 @@ impl SortedSetData {
         self.members.get(member).copied()
     }
 
+    pub fn remove(&mut self, member: &Bytes) -> bool {
+        if let Some(&score) = self.members.get(member) {
+            self.scores.remove(&OrderedScore::new(score, member.clone()));
+            self.members.remove(member);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn range(&self, start: i64, stop: i64) -> Vec<Bytes> {
         let len = self.scores.len() as i64;
         if len == 0 {

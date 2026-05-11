@@ -52,6 +52,7 @@ pub fn handle_command(
         b"ZRANGE" => handle_zrange(&parts, storage),
         b"ZCARD" => handle_zcard(&parts, storage),
         b"ZSCORE" => handle_zscore(&parts, storage),
+        b"ZREM" => handle_zrem(&parts, storage),
         _ => RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec()),
     }
 }
@@ -402,4 +403,44 @@ fn handle_zscore(
         Some(s) => RedisValueRef::BulkString(Bytes::from(format!("{}", s))),
         None => RedisValueRef::NullBulkString,
     }
+}
+
+fn handle_zrem(
+    parts: &[RedisValueRef],
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+) -> RedisValueRef {
+    if parts.len() < 3 {
+        return RedisValueRef::ErrorMsg(
+            b"ERR wrong number of arguments for 'zrem' command".to_vec(),
+        );
+    }
+
+    let key = match parts.get(1) {
+        Some(RedisValueRef::BulkString(msg)) => msg.clone(),
+        _ => return RedisValueRef::ErrorMsg(b"ERR invalid key type".to_vec()),
+    };
+
+    let mut entry = match storage.get_mut(&key) {
+        Some(entry) => entry,
+        None => return RedisValueRef::Int(0),
+    };
+
+    let zset = match &mut entry.data {
+        RedisValue::SortedSet(z) => z,
+        _ => {
+            return RedisValueRef::ErrorMsg(
+                b"WRONGTYPE operation against a key holding wrong type value".to_vec(),
+            );
+        }
+    };
+
+    let removed = parts[2..]
+        .iter()
+        .filter(|p| match p {
+            RedisValueRef::BulkString(m) => zset.remove(m),
+            _ => false,
+        })
+        .count();
+
+    RedisValueRef::Int(removed as i64)
 }
