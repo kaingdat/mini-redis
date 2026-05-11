@@ -48,14 +48,12 @@ pub fn handle_command(
         b"SET" => handle_set(&parts, storage),
         b"GET" => handle_get(&parts, storage),
         b"ZADD" => handle_zadd(&parts, storage),
+        b"ZRANK" => handle_zrank(&parts, storage),
         _ => RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec()),
     }
 }
 
-fn handle_get(
-    parts: &[RedisValueRef],
-    storage: &Arc<DashMap<Bytes, ValueEntry>>,
-) -> RedisValueRef {
+fn handle_get(parts: &[RedisValueRef], storage: &Arc<DashMap<Bytes, ValueEntry>>) -> RedisValueRef {
     if parts.len() != 2 {
         return RedisValueRef::ErrorMsg(
             b"ERR wrong number of arguments for 'get' command".to_vec(),
@@ -86,10 +84,7 @@ fn handle_get(
     }
 }
 
-fn handle_set(
-    parts: &[RedisValueRef],
-    storage: &Arc<DashMap<Bytes, ValueEntry>>,
-) -> RedisValueRef {
+fn handle_set(parts: &[RedisValueRef], storage: &Arc<DashMap<Bytes, ValueEntry>>) -> RedisValueRef {
     if parts.len() != 3 && parts.len() != 5 {
         return RedisValueRef::ErrorMsg(
             b"ERR wrong number of arguments for 'set' command".to_vec(),
@@ -236,5 +231,47 @@ fn parse_score(s: &str) -> Result<f64, RedisValueRef> {
         Err(_) => Err(RedisValueRef::ErrorMsg(
             b"ERR value is not a valid float".to_vec(),
         )),
+    }
+}
+
+fn handle_zrank(
+    parts: &[RedisValueRef],
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+) -> RedisValueRef {
+    if parts.len() != 3 {
+        return RedisValueRef::ErrorMsg(
+            b"ERR wrong number of arguments for 'zrank' command".to_vec(),
+        );
+    }
+
+    let key = match parts.get(1) {
+        Some(RedisValueRef::BulkString(msg)) => msg.clone(),
+        _ => return RedisValueRef::ErrorMsg(b"ERR invalid key type".to_vec()),
+    };
+
+    let member = match parts.get(2) {
+        Some(RedisValueRef::BulkString(msg)) => msg.clone(),
+        _ => return RedisValueRef::ErrorMsg(b"ERR invalid member type".to_vec()),
+    };
+
+    let entry = match storage.get(&key) {
+        Some(entry) => entry,
+        None => {
+            return RedisValueRef::NullBulkString;
+        }
+    };
+
+    let zset = match &entry.data {
+        RedisValue::SortedSet(z) => z,
+        _ => {
+            return RedisValueRef::ErrorMsg(
+                b"WRONGTYPE operation against a key holding wrong type value".to_vec(),
+            );
+        }
+    };
+
+    match zset.rank(&member) {
+        Some(r) => RedisValueRef::Int(r),
+        None => RedisValueRef::NullBulkString,
     }
 }

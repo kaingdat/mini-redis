@@ -41,6 +41,12 @@ impl SortedSetData {
     pub fn len(&self) -> usize {
         self.members.len()
     }
+
+    pub fn rank(&self, member: &Bytes) -> Option<i64> {
+        let score = self.members.get(member)?;
+        let target = OrderedScore::new(*score, member.clone());
+        Some(self.scores.range(..target).count() as i64)
+    }
 }
 
 #[derive(PartialEq, Eq, Clone)]
