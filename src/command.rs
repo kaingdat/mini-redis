@@ -51,6 +51,7 @@ pub fn handle_command(
         b"ZRANK" => handle_zrank(&parts, storage),
         b"ZRANGE" => handle_zrange(&parts, storage),
         b"ZCARD" => handle_zcard(&parts, storage),
+        b"ZSCORE" => handle_zscore(&parts, storage),
         _ => RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec()),
     }
 }
@@ -267,12 +268,7 @@ fn handle_zrange(
     };
 
     let members = zset.range(start, stop);
-    RedisValueRef::Array(
-        members
-            .into_iter()
-            .map(RedisValueRef::BulkString)
-            .collect(),
-    )
+    RedisValueRef::Array(members.into_iter().map(RedisValueRef::BulkString).collect())
 }
 
 fn handle_zcard(
@@ -364,6 +360,46 @@ fn handle_zrank(
 
     match zset.rank(&member) {
         Some(r) => RedisValueRef::Int(r),
+        None => RedisValueRef::NullBulkString,
+    }
+}
+
+fn handle_zscore(
+    parts: &[RedisValueRef],
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+) -> RedisValueRef {
+    if parts.len() != 3 {
+        return RedisValueRef::ErrorMsg(
+            b"ERR wrong number of arguments for 'zscore' command".to_vec(),
+        );
+    }
+
+    let key = match parts.get(1) {
+        Some(RedisValueRef::BulkString(msg)) => msg.clone(),
+        _ => return RedisValueRef::ErrorMsg(b"ERR invalid key type".to_vec()),
+    };
+
+    let member = match parts.get(2) {
+        Some(RedisValueRef::BulkString(msg)) => msg.clone(),
+        _ => return RedisValueRef::ErrorMsg(b"ERR invalid member type".to_vec()),
+    };
+
+    let entry = match storage.get(&key) {
+        Some(entry) => entry,
+        None => return RedisValueRef::NullBulkString,
+    };
+
+    let zset = match &entry.data {
+        RedisValue::SortedSet(z) => z,
+        _ => {
+            return RedisValueRef::ErrorMsg(
+                b"WRONGTYPE operation against a key holding wrong type value".to_vec(),
+            );
+        }
+    };
+
+    match zset.score(&member) {
+        Some(s) => RedisValueRef::BulkString(Bytes::from(format!("{}", s))),
         None => RedisValueRef::NullBulkString,
     }
 }
