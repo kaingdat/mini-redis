@@ -47,6 +47,24 @@ impl SortedSetData {
         let target = OrderedScore::new(*score, member.clone());
         Some(self.scores.range(..target).count() as i64)
     }
+
+    pub fn range(&self, start: i64, stop: i64) -> Vec<Bytes> {
+        let len = self.scores.len() as i64;
+        if len == 0 || start >= len {
+            return vec![];
+        }
+        let start = start.max(0) as usize;
+        let stop = stop.min(len - 1) as usize;
+        if start > stop {
+            return vec![];
+        }
+        self.scores
+            .iter()
+            .skip(start)
+            .take(stop - start + 1)
+            .map(|e| e.member.clone())
+            .collect()
+    }
 }
 
 #[derive(PartialEq, Eq, Clone)]

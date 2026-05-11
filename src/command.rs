@@ -49,6 +49,7 @@ pub fn handle_command(
         b"GET" => handle_get(&parts, storage),
         b"ZADD" => handle_zadd(&parts, storage),
         b"ZRANK" => handle_zrank(&parts, storage),
+        b"ZRANGE" => handle_zrange(&parts, storage),
         _ => RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec()),
     }
 }
@@ -209,6 +210,68 @@ fn handle_zadd(
     }
 
     RedisValueRef::Int(added_count)
+}
+
+fn handle_zrange(
+    parts: &[RedisValueRef],
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+) -> RedisValueRef {
+    if parts.len() != 4 {
+        return RedisValueRef::ErrorMsg(
+            b"ERR wrong number of arguments for 'zrange' command".to_vec(),
+        );
+    }
+
+    let key = match parts.get(1) {
+        Some(RedisValueRef::BulkString(msg)) => msg.clone(),
+        _ => return RedisValueRef::ErrorMsg(b"ERR invalid key type".to_vec()),
+    };
+
+    let parse_index = |part: &RedisValueRef| -> Result<i64, RedisValueRef> {
+        match part {
+            RedisValueRef::BulkString(s) => std::str::from_utf8(s)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or_else(|| {
+                    RedisValueRef::ErrorMsg(b"ERR value is not an integer or out of range".to_vec())
+                }),
+            _ => Err(RedisValueRef::ErrorMsg(b"ERR invalid argument".to_vec())),
+        }
+    };
+
+    let start = match parts.get(2).map(parse_index) {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => return e,
+        None => return RedisValueRef::ErrorMsg(b"ERR missing start index".to_vec()),
+    };
+
+    let stop = match parts.get(3).map(parse_index) {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => return e,
+        None => return RedisValueRef::ErrorMsg(b"ERR missing stop index".to_vec()),
+    };
+
+    let entry = match storage.get(&key) {
+        Some(e) => e,
+        None => return RedisValueRef::Array(vec![]),
+    };
+
+    let zset = match &entry.data {
+        RedisValue::SortedSet(z) => z,
+        _ => {
+            return RedisValueRef::ErrorMsg(
+                b"WRONGTYPE Operation against a key holding wrong type value".to_vec(),
+            );
+        }
+    };
+
+    let members = zset.range(start, stop);
+    RedisValueRef::Array(
+        members
+            .into_iter()
+            .map(RedisValueRef::BulkString)
+            .collect(),
+    )
 }
 
 fn parse_score(s: &str) -> Result<f64, RedisValueRef> {
