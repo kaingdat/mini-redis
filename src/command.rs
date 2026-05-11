@@ -50,6 +50,7 @@ pub fn handle_command(
         b"ZADD" => handle_zadd(&parts, storage),
         b"ZRANK" => handle_zrank(&parts, storage),
         b"ZRANGE" => handle_zrange(&parts, storage),
+        b"ZCARD" => handle_zcard(&parts, storage),
         _ => RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec()),
     }
 }
@@ -272,6 +273,34 @@ fn handle_zrange(
             .map(RedisValueRef::BulkString)
             .collect(),
     )
+}
+
+fn handle_zcard(
+    parts: &[RedisValueRef],
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+) -> RedisValueRef {
+    if parts.len() != 2 {
+        return RedisValueRef::ErrorMsg(
+            b"ERR wrong number of arguments for 'zcard' command".to_vec(),
+        );
+    }
+
+    let key = match parts.get(1) {
+        Some(RedisValueRef::BulkString(msg)) => msg,
+        _ => return RedisValueRef::ErrorMsg(b"ERR invalid key type".to_vec()),
+    };
+
+    let entry = match storage.get(key) {
+        Some(e) => e,
+        None => return RedisValueRef::Int(0),
+    };
+
+    match &entry.data {
+        RedisValue::SortedSet(z) => RedisValueRef::Int(z.len() as i64),
+        _ => RedisValueRef::ErrorMsg(
+            b"WRONGTYPE Operation against a key holding wrong type value".to_vec(),
+        ),
+    }
 }
 
 fn parse_score(s: &str) -> Result<f64, RedisValueRef> {
