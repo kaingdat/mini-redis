@@ -50,11 +50,21 @@ impl SortedSetData {
 
     pub fn range(&self, start: i64, stop: i64) -> Vec<Bytes> {
         let len = self.scores.len() as i64;
-        if len == 0 || start >= len {
+        if len == 0 {
             return vec![];
         }
-        let start = start.max(0) as usize;
-        let stop = stop.min(len - 1) as usize;
+        let resolve = |idx: i64| -> i64 {
+            if idx < 0 {
+                (len + idx).max(0)
+            } else {
+                idx
+            }
+        };
+        let start = resolve(start) as usize;
+        let stop = resolve(stop).min(len - 1) as usize;
+        if start as i64 >= len {
+            return vec![];
+        }
         if start > stop {
             return vec![];
         }
