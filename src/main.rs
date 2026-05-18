@@ -9,9 +9,23 @@ use tokio_util::codec::Framed;
 use codecrafters_redis::command::{ValueEntry, handle_command};
 use codecrafters_redis::resp::RespParser;
 
+fn parse_port() -> u16 {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--port" {
+            let port = args.next().expect("--port requires a value");
+            return port
+                .parse::<u16>()
+                .expect("--port value must be a valid number");
+        }
+    }
+    6379
+}
+
 #[tokio::main]
 async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    let port = parse_port();
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     let storage = Arc::new(DashMap::<Bytes, ValueEntry>::new());
     loop {
         match listener.accept().await {
