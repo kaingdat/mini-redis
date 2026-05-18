@@ -70,21 +70,15 @@ fn handle_get(parts: &[RedisValueRef], storage: &Arc<DashMap<Bytes, ValueEntry>>
         _ => return RedisValueRef::ErrorMsg(b"ERR invalid key type".to_vec()),
     };
 
+    storage.remove_if(key, |_, entry| entry.is_expired());
+
     match storage.get(key) {
-        Some(entry) => {
-            if entry.is_expired() {
-                drop(entry);
-                storage.remove(key);
-                RedisValueRef::NullBulkString
-            } else {
-                match &entry.data {
-                    RedisValue::String(data) => RedisValueRef::BulkString(data.clone()),
-                    _ => RedisValueRef::ErrorMsg(
-                        b"WRONGTYPE Operation against a key holding wrong type value".to_vec(),
-                    ),
-                }
-            }
-        }
+        Some(entry) => match &entry.data {
+            RedisValue::String(data) => RedisValueRef::BulkString(data.clone()),
+            _ => RedisValueRef::ErrorMsg(
+                b"WRONGTYPE Operation against a key holding wrong type value".to_vec(),
+            ),
+        },
         None => RedisValueRef::NullBulkString,
     }
 }
