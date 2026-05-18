@@ -53,6 +53,7 @@ pub fn handle_command(
         b"ZCARD" => handle_zcard(&parts, storage),
         b"ZSCORE" => handle_zscore(&parts, storage),
         b"ZREM" => handle_zrem(&parts, storage),
+        b"INFO" => handle_info(&parts),
         _ => RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec()),
     }
 }
@@ -443,4 +444,9 @@ fn handle_zrem(
         .count();
 
     RedisValueRef::Int(removed as i64)
+}
+
+fn handle_info(_parts: &[RedisValueRef]) -> RedisValueRef {
+    let body = "# Replication\r\nrole:master\r\n";
+    RedisValueRef::BulkString(Bytes::from_static(body.as_bytes()))
 }
