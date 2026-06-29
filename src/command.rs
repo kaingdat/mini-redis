@@ -10,6 +10,24 @@ use crate::{
     value::{RedisValue, SortedSetData},
 };
 
+pub enum Role {
+    Master,
+    Replica { host: String, port: u16 },
+}
+
+impl Role {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Role::Master => "master",
+            Role::Replica { .. } => "slave",
+        }
+    }
+}
+
+pub struct ServerConfig {
+    pub role: Role,
+}
+
 pub struct ValueEntry {
     data: RedisValue,
     expires_at: Option<Instant>,
@@ -104,6 +122,7 @@ macro_rules! arity {
 pub fn handle_command(
     value: RedisValueRef,
     storage: &Arc<DashMap<Bytes, ValueEntry>>,
+    config: &Arc<ServerConfig>,
 ) -> RedisValueRef {
     let RedisValueRef::Array(parts) = value else {
         return RedisValueRef::ErrorMsg(b"ERR expected array command".to_vec());
@@ -134,7 +153,7 @@ pub fn handle_command(
         Command::ZCard => handle_zcard(&parts, storage),
         Command::ZScore => handle_zscore(&parts, storage),
         Command::ZRem => handle_zrem(&parts, storage),
-        Command::Info => handle_info(&parts),
+        Command::Info => handle_info(&parts, config),
     }
 }
 
@@ -428,7 +447,7 @@ fn handle_zrem(
     RedisValueRef::Int(removed as i64)
 }
 
-fn handle_info(_parts: &[RedisValueRef]) -> RedisValueRef {
-    let body = "# Replication\r\nrole:master\r\n";
-    RedisValueRef::BulkString(Bytes::from_static(body.as_bytes()))
+fn handle_info(_parts: &[RedisValueRef], config: &Arc<ServerConfig>) -> RedisValueRef {
+    let body = format!("# Replication\r\nrole:{}\r\n", config.role.name());
+    RedisValueRef::BulkString(Bytes::from(body))
 }
