@@ -3,13 +3,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use rand::RngExt;
 use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
 
 use codecrafters_redis::command::{Role, ServerConfig, ValueEntry, handle_command};
 use codecrafters_redis::resp::RespParser;
 
-fn parse_config() -> (u16, ServerConfig) {
+fn parse_config() -> ServerConfig {
     let mut port = 6379;
     let mut role = Role::Master;
 
@@ -40,14 +41,27 @@ fn parse_config() -> (u16, ServerConfig) {
         }
     }
 
-    (port, ServerConfig { role })
+    ServerConfig {
+        port,
+        role,
+        replid: generate_replid(),
+        repl_offset: 0,
+    }
+}
+
+fn generate_replid() -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut rng = rand::rng();
+    (0..40)
+        .map(|_| HEX[rng.random_range(0..HEX.len())] as char)
+        .collect()
 }
 
 #[tokio::main]
 async fn main() {
-    let (port, config) = parse_config();
+    let config = parse_config();
     let config = Arc::new(config);
-    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
     let storage = Arc::new(DashMap::<Bytes, ValueEntry>::new());
     loop {
         match listener.accept().await {

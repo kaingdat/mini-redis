@@ -25,7 +25,10 @@ impl Role {
 }
 
 pub struct ServerConfig {
+    pub port: u16,
     pub role: Role,
+    pub replid: String,
+    pub repl_offset: u64,
 }
 
 pub struct ValueEntry {
@@ -448,6 +451,14 @@ fn handle_zrem(
 }
 
 fn handle_info(_parts: &[RedisValueRef], config: &Arc<ServerConfig>) -> RedisValueRef {
-    let body = format!("# Replication\r\nrole:{}\r\n", config.role.name());
+    let body = format!(
+        "# Replication\r\n\
+         role:{}\r\n\
+         master_replid:{}\r\n\
+         master_repl_offset:{}\r\n",
+        config.role.name(),
+        config.replid,
+        config.repl_offset,
+    );
     RedisValueRef::BulkString(Bytes::from(body))
 }
