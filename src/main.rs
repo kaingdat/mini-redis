@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use codecrafters_redis::types::RedisValueRef;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use rand::RngExt;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 use codecrafters_redis::command::{Role, ServerConfig, ValueEntry, handle_command};
@@ -63,6 +64,18 @@ async fn main() {
     let config = Arc::new(config);
     let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
     let storage = Arc::new(DashMap::<Bytes, ValueEntry>::new());
+
+    if let Role::Replica { host, port } = &config.role {
+        let host = host.clone();
+        let master_port = *port;
+        let listening_port = config.port;
+        tokio::spawn(async move {
+            if let Err(e) = handshake(&host, master_port, listening_port).await {
+                eprintln!("handshake with master failed: {}", e);
+            }
+        });
+    }
+
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -80,5 +93,51 @@ async fn main() {
             }
             Err(e) => eprintln!("error: {}", e),
         }
+    }
+}
+
+async fn handshake(host: &str, master_port: u16, listening_port: u16) -> anyhow::Result<()> {
+    let stream = TcpStream::connect((host, master_port)).await?;
+    let mut framed = Framed::new(stream, RespParser::default());
+
+    framed.send(resp_command(&[b"PING"])).await?;
+    read_reply(&mut framed).await?;
+
+    let port_str = listening_port.to_string();
+    framed
+        .send(resp_command(&[
+            b"REPLCONF",
+            b"listening-port",
+            port_str.as_bytes(),
+        ]))
+        .await?;
+    read_reply(&mut framed).await?;
+
+    framed
+        .send(resp_command(&[b"REPLCONF", b"capa", b"psync2"]))
+        .await?;
+    read_reply(&mut framed).await?;
+
+    framed
+        .send(resp_command(&[b"PSYNC", b"?", b"-1"]))
+        .await?;
+    read_reply(&mut framed).await?;
+
+    Ok(())
+}
+
+fn resp_command(args: &[&[u8]]) -> RedisValueRef {
+    RedisValueRef::Array(
+        args.iter()
+            .map(|a| RedisValueRef::BulkString(Bytes::copy_from_slice(a)))
+            .collect(),
+    )
+}
+
+async fn read_reply(framed: &mut Framed<TcpStream, RespParser>) -> anyhow::Result<RedisValueRef> {
+    match framed.next().await {
+        Some(Ok(reply)) => Ok(reply),
+        Some(Err(_)) => Err(anyhow::anyhow!("failed to parse master reply")),
+        None => Err(anyhow::anyhow!("master closed connection during handshake")),
     }
 }
