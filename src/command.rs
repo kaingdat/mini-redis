@@ -42,7 +42,7 @@ impl ValueEntry {
     }
 
     pub fn is_expired(&self) -> bool {
-        self.expires_at.map_or(false, |exp| Instant::now() >= exp)
+        self.expires_at.is_some_and(|exp| Instant::now() >= exp)
     }
 }
 
@@ -58,6 +58,8 @@ enum Command {
     ZScore,
     ZRem,
     Info,
+    ReplConf,
+    Psync,
 }
 
 impl Command {
@@ -74,6 +76,8 @@ impl Command {
             b"ZSCORE" => Self::ZScore,
             b"ZREM" => Self::ZRem,
             b"INFO" => Self::Info,
+            b"REPLCONF" => Self::ReplConf,
+            b"PSYNC" => Self::Psync,
             _ => return None,
         })
     }
@@ -157,6 +161,8 @@ pub fn handle_command(
         Command::ZScore => handle_zscore(&parts, storage),
         Command::ZRem => handle_zrem(&parts, storage),
         Command::Info => handle_info(&parts, config),
+        Command::ReplConf => handle_replconf(),
+        Command::Psync => handle_psync(&parts, config),
     }
 }
 
@@ -235,7 +241,7 @@ fn handle_zadd(
     parts: &[RedisValueRef],
     storage: &Arc<DashMap<Bytes, ValueEntry>>,
 ) -> RedisValueRef {
-    if parts.len() < 4 || (parts.len() - 2) % 2 != 0 {
+    if parts.len() < 4 || !(parts.len() - 2).is_multiple_of(2) {
         return wrong_arity("zadd");
     }
 
@@ -461,4 +467,13 @@ fn handle_info(_parts: &[RedisValueRef], config: &Arc<ServerConfig>) -> RedisVal
         config.repl_offset,
     );
     RedisValueRef::BulkString(Bytes::from(body))
+}
+
+fn handle_replconf() -> RedisValueRef {
+    RedisValueRef::SimpleString(Bytes::from_static(b"OK"))
+}
+
+fn handle_psync(_parts: &[RedisValueRef], config: &Arc<ServerConfig>) -> RedisValueRef {
+    let body = format!("FULLRESYNC {} {}", config.replid, config.repl_offset);
+    RedisValueRef::SimpleString(Bytes::from(body))
 }

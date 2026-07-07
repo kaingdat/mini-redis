@@ -14,6 +14,12 @@ pub struct SortedSetData {
     scores: BTreeSet<OrderedScore>,
 }
 
+impl Default for SortedSetData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SortedSetData {
     pub fn new() -> Self {
         Self {
@@ -40,6 +46,10 @@ impl SortedSetData {
 
     pub fn len(&self) -> usize {
         self.members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
     }
 
     pub fn rank(&self, member: &Bytes) -> Option<i64> {
