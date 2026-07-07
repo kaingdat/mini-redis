@@ -82,7 +82,7 @@ async fn main() {
                 let storage = Arc::clone(&storage);
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
-                    let mut framed = Framed::new(stream, RespParser::default());
+                    let mut framed = Framed::new(stream, RespParser);
                     while let Some(Ok(value)) = framed.next().await {
                         let response = handle_command(value, &storage, &config);
                         if framed.send(response).await.is_err() {
@@ -98,7 +98,7 @@ async fn main() {
 
 async fn handshake(host: &str, master_port: u16, listening_port: u16) -> anyhow::Result<()> {
     let stream = TcpStream::connect((host, master_port)).await?;
-    let mut framed = Framed::new(stream, RespParser::default());
+    let mut framed = Framed::new(stream, RespParser);
 
     framed.send(resp_command(&[b"PING"])).await?;
     read_reply(&mut framed).await?;
@@ -118,9 +118,7 @@ async fn handshake(host: &str, master_port: u16, listening_port: u16) -> anyhow:
         .await?;
     read_reply(&mut framed).await?;
 
-    framed
-        .send(resp_command(&[b"PSYNC", b"?", b"-1"]))
-        .await?;
+    framed.send(resp_command(&[b"PSYNC", b"?", b"-1"])).await?;
     read_reply(&mut framed).await?;
 
     Ok(())
