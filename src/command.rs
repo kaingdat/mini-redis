@@ -1,7 +1,7 @@
 use core::f64;
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::time::Instant;
 
@@ -29,6 +29,20 @@ pub struct ServerConfig {
     pub role: Role,
     pub replid: String,
     pub repl_offset: u64,
+    pub dir: String,
+    pub dbfilename: String,
+    pub rdb: Bytes,
+}
+
+impl ServerConfig {
+    pub fn rdb_path(&self) -> PathBuf {
+        std::path::Path::new(&self.dir).join(&self.dbfilename)
+    }
+
+    pub fn load_rdb(&mut self) {
+        let raw = std::fs::read(&self.rdb_path()).unwrap();
+        self.rdb = Bytes::from(raw);
+    }
 }
 
 pub struct ValueEntry {
@@ -474,6 +488,14 @@ fn handle_replconf() -> RedisValueRef {
 }
 
 fn handle_psync(_parts: &[RedisValueRef], config: &Arc<ServerConfig>) -> RedisValueRef {
-    let body = format!("FULLRESYNC {} {}", config.replid, config.repl_offset);
-    RedisValueRef::SimpleString(Bytes::from(body))
+    let mut out = BytesMut::new();
+
+    out.extend_from_slice(
+        format!("+FULLRESYNC {} {}\r\n", config.replid, config.repl_offset).as_bytes(),
+    );
+
+    out.extend_from_slice(format!("${}\r\n", config.rdb.len()).as_bytes());
+    out.extend_from_slice(&config.rdb);
+
+    RedisValueRef::Raw(out.freeze())
 }
