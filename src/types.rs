@@ -10,6 +10,7 @@ pub enum RedisValueRef {
     Array(Vec<RedisValueRef>),
     NullArray,
     NullBulkString,
+    Raw(Bytes),
 }
 
 pub const NULL_BULK_STRING: &str = "$-1\r\n";

@@ -1,19 +1,22 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use codecrafters_redis::types::RedisValueRef;
+use codecrafters_redis::{
+    command::{Role, ServerConfig, ValueEntry, handle_command},
+    resp::RespParser,
+    types::RedisValueRef,
+};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use rand::RngExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
-use codecrafters_redis::command::{Role, ServerConfig, ValueEntry, handle_command};
-use codecrafters_redis::resp::RespParser;
-
 fn parse_config() -> ServerConfig {
     let mut port = 6379;
     let mut role = Role::Master;
+    let mut dir = ".".to_string();
+    let mut dbfilename = "empty.rdb".to_string();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -38,6 +41,8 @@ fn parse_config() -> ServerConfig {
                     port: master_port,
                 };
             }
+            "--dir" => dir = args.next().expect("--dir requires a value"),
+            "--dbfilename" => dbfilename = args.next().expect("--dbfilename requires a value"),
             _ => {}
         }
     }
@@ -47,6 +52,9 @@ fn parse_config() -> ServerConfig {
         role,
         replid: generate_replid(),
         repl_offset: 0,
+        dir,
+        dbfilename,
+        rdb: Bytes::new(),
     }
 }
 
@@ -60,7 +68,8 @@ fn generate_replid() -> String {
 
 #[tokio::main]
 async fn main() {
-    let config = parse_config();
+    let mut config = parse_config();
+    config.load_rdb();
     let config = Arc::new(config);
     let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
     let storage = Arc::new(DashMap::<Bytes, ValueEntry>::new());

@@ -1,6 +1,7 @@
+use std::io;
+
 use bytes::{Bytes, BytesMut};
 use memchr::memchr;
-use std::io;
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::types::{NULL_ARRAY, NULL_BULK_STRING, RedisValueRef};
@@ -223,5 +224,6 @@ fn write_redis_value(item: RedisValueRef, dst: &mut BytesMut) {
         }
         RedisValueRef::NullArray => dst.extend_from_slice(NULL_ARRAY.as_bytes()),
         RedisValueRef::NullBulkString => dst.extend_from_slice(NULL_BULK_STRING.as_bytes()),
+        RedisValueRef::Raw(raw) => dst.extend_from_slice(&raw),
     }
 }
