@@ -185,6 +185,12 @@ impl Encoder<RedisValueRef> for RespParser {
     }
 }
 
+pub fn encode_command(parts: &[RedisValueRef]) -> Bytes {
+    let mut buf = BytesMut::new();
+    write_redis_value(RedisValueRef::Array(parts.to_vec()), &mut buf);
+    buf.freeze()
+}
+
 fn write_redis_value(item: RedisValueRef, dst: &mut BytesMut) {
     match item {
         RedisValueRef::Error(e) => {
