@@ -1,11 +1,27 @@
 use std::collections::{BTreeSet, HashMap};
 
 use bytes::Bytes;
+use tokio::time::Instant;
 
 #[derive(Clone)]
 pub enum RedisValue {
     String(Bytes),
     SortedSet(SortedSetData),
+}
+
+pub struct ValueEntry {
+    pub data: RedisValue,
+    pub expires_at: Option<Instant>,
+}
+
+impl ValueEntry {
+    pub fn new(data: RedisValue, expires_at: Option<Instant>) -> Self {
+        Self { data, expires_at }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.expires_at.is_some_and(|exp| Instant::now() >= exp)
+    }
 }
 
 #[derive(Clone)]

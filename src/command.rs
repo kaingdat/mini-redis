@@ -1,65 +1,18 @@
 use core::f64;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::time::Instant;
 
 use crate::{
+    resp::encode_command,
+    server::{ReplicaRegistry, ServerConfig},
     types::RedisValueRef,
-    value::{RedisValue, SortedSetData},
+    value::{RedisValue, SortedSetData, ValueEntry},
 };
 
-pub enum Role {
-    Master,
-    Replica { host: String, port: u16 },
-}
-
-impl Role {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Role::Master => "master",
-            Role::Replica { .. } => "slave",
-        }
-    }
-}
-
-pub struct ServerConfig {
-    pub port: u16,
-    pub role: Role,
-    pub replid: String,
-    pub repl_offset: u64,
-    pub dir: String,
-    pub dbfilename: String,
-    pub rdb: Bytes,
-}
-
-impl ServerConfig {
-    pub fn rdb_path(&self) -> PathBuf {
-        std::path::Path::new(&self.dir).join(&self.dbfilename)
-    }
-
-    pub fn load_rdb(&mut self) {
-        let raw = std::fs::read(&self.rdb_path()).unwrap();
-        self.rdb = Bytes::from(raw);
-    }
-}
-
-pub struct ValueEntry {
-    data: RedisValue,
-    expires_at: Option<Instant>,
-}
-
-impl ValueEntry {
-    pub fn new(data: RedisValue, expires_at: Option<Instant>) -> Self {
-        Self { data, expires_at }
-    }
-
-    pub fn is_expired(&self) -> bool {
-        self.expires_at.is_some_and(|exp| Instant::now() >= exp)
-    }
-}
-
+#[derive(Clone, Copy)]
 enum Command {
     Ping,
     Echo,
@@ -95,6 +48,14 @@ impl Command {
             _ => return None,
         })
     }
+
+    fn is_write(&self) -> bool {
+        matches!(self, Command::Set | Command::ZAdd | Command::ZRem)
+    }
+}
+
+pub fn is_psync_command(value: &RedisValueRef) -> bool {
+    matches!(value, RedisValueRef::Array(parts) if matches!(parts.first(), Some(RedisValueRef::BulkString(cmd)) if cmd.eq_ignore_ascii_case(b"PSYNC")))
 }
 
 const WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding wrong type value";
@@ -141,9 +102,10 @@ macro_rules! arity {
 }
 
 pub fn handle_command(
-    value: RedisValueRef,
+    value: &RedisValueRef,
     storage: &Arc<DashMap<Bytes, ValueEntry>>,
     config: &Arc<ServerConfig>,
+    replicas: &Arc<ReplicaRegistry>,
 ) -> RedisValueRef {
     let RedisValueRef::Array(parts) = value else {
         return RedisValueRef::ErrorMsg(b"ERR expected array command".to_vec());
@@ -157,27 +119,41 @@ pub fn handle_command(
         return RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec());
     };
 
-    match command {
+    let response = match command {
         Command::Ping => RedisValueRef::SimpleString(Bytes::from_static(b"PONG")),
         Command::Echo => {
             arity!(parts, "echo", == 2);
-            match require_bulk(&parts, 1) {
+            match require_bulk(parts, 1) {
                 Ok(b) => RedisValueRef::BulkString(b.clone()),
                 Err(e) => e,
             }
         }
-        Command::Set => handle_set(&parts, storage),
-        Command::Get => handle_get(&parts, storage),
-        Command::ZAdd => handle_zadd(&parts, storage),
-        Command::ZRank => handle_zrank(&parts, storage),
-        Command::ZRange => handle_zrange(&parts, storage),
-        Command::ZCard => handle_zcard(&parts, storage),
-        Command::ZScore => handle_zscore(&parts, storage),
-        Command::ZRem => handle_zrem(&parts, storage),
-        Command::Info => handle_info(&parts, config),
+        Command::Set => handle_set(parts, storage),
+        Command::Get => handle_get(parts, storage),
+        Command::ZAdd => handle_zadd(parts, storage),
+        Command::ZRank => handle_zrank(parts, storage),
+        Command::ZRange => handle_zrange(parts, storage),
+        Command::ZCard => handle_zcard(parts, storage),
+        Command::ZScore => handle_zscore(parts, storage),
+        Command::ZRem => handle_zrem(parts, storage),
+        Command::Info => handle_info(parts, config),
         Command::ReplConf => handle_replconf(),
-        Command::Psync => handle_psync(&parts, config),
+        Command::Psync => handle_psync(parts, config),
+    };
+
+    if command.is_write() {
+        propagate(parts, replicas);
     }
+
+    response
+}
+
+fn propagate(parts: &[RedisValueRef], replicas: &Arc<ReplicaRegistry>) {
+    if replicas.is_empty() {
+        return;
+    }
+    let encoded = encode_command(parts);
+    replicas.retain(|_, tx| tx.send(encoded.clone()).is_ok());
 }
 
 fn handle_get(parts: &[RedisValueRef], storage: &Arc<DashMap<Bytes, ValueEntry>>) -> RedisValueRef {

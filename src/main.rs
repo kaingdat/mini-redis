@@ -1,78 +1,27 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicU64};
 
 use bytes::Bytes;
 use codecrafters_redis::{
-    command::{Role, ServerConfig, ValueEntry, handle_command},
+    command::{handle_command, is_psync_command},
+    replication::{handshake, stream_to_replica},
     resp::RespParser,
-    types::RedisValueRef,
+    server::{ReplicaRegistry, Role, ServerConfig},
+    value::ValueEntry,
 };
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use rand::RngExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
-
-fn parse_config() -> ServerConfig {
-    let mut port = 6379;
-    let mut role = Role::Master;
-    let mut dir = ".".to_string();
-    let mut dbfilename = "empty.rdb".to_string();
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--port" => {
-                let value = args.next().expect("--port requires a value");
-                port = value
-                    .parse::<u16>()
-                    .expect("--port value must be a valid number");
-            }
-            "--replicaof" => {
-                let value = args.next().expect("--replicaof requires a value");
-                let mut it = value.split_whitespace();
-                let host = it.next().expect("--replicaof requires host").to_string();
-                let master_port = it
-                    .next()
-                    .expect("--replicaof requires port")
-                    .parse::<u16>()
-                    .expect("--replicaof port must be a valid number");
-                role = Role::Replica {
-                    host,
-                    port: master_port,
-                };
-            }
-            "--dir" => dir = args.next().expect("--dir requires a value"),
-            "--dbfilename" => dbfilename = args.next().expect("--dbfilename requires a value"),
-            _ => {}
-        }
-    }
-
-    ServerConfig {
-        port,
-        role,
-        replid: generate_replid(),
-        repl_offset: 0,
-        dir,
-        dbfilename,
-        rdb: Bytes::new(),
-    }
-}
-
-fn generate_replid() -> String {
-    const HEX: &[u8] = b"0123456789abcdef";
-    let mut rng = rand::rng();
-    (0..40)
-        .map(|_| HEX[rng.random_range(0..HEX.len())] as char)
-        .collect()
-}
 
 #[tokio::main]
 async fn main() {
-    let mut config = parse_config();
+    let mut config = ServerConfig::from_args();
     config.load_rdb();
     let config = Arc::new(config);
     let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
     let storage = Arc::new(DashMap::<Bytes, ValueEntry>::new());
+    let replicas = Arc::new(ReplicaRegistry::new());
+    let next_conn_id = Arc::new(AtomicU64::new(0));
 
     if let Role::Replica { host, port } = &config.role {
         let host = host.clone();
@@ -90,11 +39,19 @@ async fn main() {
             Ok((stream, _addr)) => {
                 let storage = Arc::clone(&storage);
                 let config = Arc::clone(&config);
+                let replicas = Arc::clone(&replicas);
+                let next_conn_id = Arc::clone(&next_conn_id);
                 tokio::spawn(async move {
                     let mut framed = Framed::new(stream, RespParser);
                     while let Some(Ok(value)) = framed.next().await {
-                        let response = handle_command(value, &storage, &config);
+                        let is_replica = is_psync_command(&value);
+                        let response = handle_command(&value, &storage, &config, &replicas);
                         if framed.send(response).await.is_err() {
+                            break;
+                        }
+
+                        if is_replica {
+                            stream_to_replica(framed, &replicas, &next_conn_id).await;
                             break;
                         }
                     }
@@ -102,49 +59,5 @@ async fn main() {
             }
             Err(e) => eprintln!("error: {}", e),
         }
-    }
-}
-
-async fn handshake(host: &str, master_port: u16, listening_port: u16) -> anyhow::Result<()> {
-    let stream = TcpStream::connect((host, master_port)).await?;
-    let mut framed = Framed::new(stream, RespParser);
-
-    framed.send(resp_command(&[b"PING"])).await?;
-    read_reply(&mut framed).await?;
-
-    let port_str = listening_port.to_string();
-    framed
-        .send(resp_command(&[
-            b"REPLCONF",
-            b"listening-port",
-            port_str.as_bytes(),
-        ]))
-        .await?;
-    read_reply(&mut framed).await?;
-
-    framed
-        .send(resp_command(&[b"REPLCONF", b"capa", b"psync2"]))
-        .await?;
-    read_reply(&mut framed).await?;
-
-    framed.send(resp_command(&[b"PSYNC", b"?", b"-1"])).await?;
-    read_reply(&mut framed).await?;
-
-    Ok(())
-}
-
-fn resp_command(args: &[&[u8]]) -> RedisValueRef {
-    RedisValueRef::Array(
-        args.iter()
-            .map(|a| RedisValueRef::BulkString(Bytes::copy_from_slice(a)))
-            .collect(),
-    )
-}
-
-async fn read_reply(framed: &mut Framed<TcpStream, RespParser>) -> anyhow::Result<RedisValueRef> {
-    match framed.next().await {
-        Some(Ok(reply)) => Ok(reply),
-        Some(Err(_)) => Err(anyhow::anyhow!("failed to parse master reply")),
-        None => Err(anyhow::anyhow!("master closed connection during handshake")),
     }
 }
