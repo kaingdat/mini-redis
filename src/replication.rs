@@ -4,11 +4,18 @@ use std::sync::{
 };
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use tokio::{net::TcpStream, sync::mpsc};
 use tokio_util::codec::Framed;
 
-use crate::{resp::RespParser, server::ReplicaRegistry, types::RedisValueRef};
+use crate::{
+    command::handle_command,
+    resp::RespParser,
+    server::{ReplicaRegistry, Role, ServerConfig},
+    types::RedisValueRef,
+    value::ValueEntry,
+};
 
 pub async fn stream_to_replica(
     mut framed: Framed<TcpStream, RespParser>,
@@ -43,9 +50,35 @@ pub async fn stream_to_replica(
     replicas.remove(&conn_id);
 }
 
-pub async fn handshake(host: &str, master_port: u16, listening_port: u16) -> anyhow::Result<()> {
+pub async fn replicate_from_master(
+    config: &Arc<ServerConfig>,
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+    replicas: &Arc<ReplicaRegistry>,
+) -> anyhow::Result<()> {
+    let Role::Replica { host, port } = &config.role else {
+        return Ok(());
+    };
+
+    let mut framed = handshake(host, *port, config.port).await?;
+
+    while let Some(incoming) = framed.next().await {
+        let Ok(value) = incoming else {
+            return Err(anyhow::anyhow!("failed to parse command from master"));
+        };
+
+        handle_command(&value, storage, config, replicas);
+    }
+
+    Ok(())
+}
+
+async fn handshake(
+    host: &str,
+    master_port: u16,
+    listening_port: u16,
+) -> anyhow::Result<Framed<TcpStream, RespParser>> {
     let stream = TcpStream::connect((host, master_port)).await?;
-    let mut framed = Framed::new(stream, RespParser);
+    let mut framed = Framed::new(stream, RespParser::default());
 
     framed.send(resp_command(&[b"PING"])).await?;
     read_reply(&mut framed).await?;
@@ -68,7 +101,10 @@ pub async fn handshake(host: &str, master_port: u16, listening_port: u16) -> any
     framed.send(resp_command(&[b"PSYNC", b"?", b"-1"])).await?;
     read_reply(&mut framed).await?;
 
-    Ok(())
+    framed.codec_mut().expect_rdb();
+    read_reply(&mut framed).await?;
+
+    Ok(framed)
 }
 
 fn resp_command(args: &[&[u8]]) -> RedisValueRef {
