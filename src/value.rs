@@ -80,7 +80,8 @@ impl SortedSetData {
 
     pub fn remove(&mut self, member: &Bytes) -> bool {
         if let Some(&score) = self.members.get(member) {
-            self.scores.remove(&OrderedScore::new(score, member.clone()));
+            self.scores
+                .remove(&OrderedScore::new(score, member.clone()));
             self.members.remove(member);
             true
         } else {
@@ -93,13 +94,7 @@ impl SortedSetData {
         if len == 0 {
             return vec![];
         }
-        let resolve = |idx: i64| -> i64 {
-            if idx < 0 {
-                (len + idx).max(0)
-            } else {
-                idx
-            }
-        };
+        let resolve = |idx: i64| -> i64 { if idx < 0 { (len + idx).max(0) } else { idx } };
         let start = resolve(start) as usize;
         let stop = resolve(stop).min(len - 1) as usize;
         if start as i64 >= len {
