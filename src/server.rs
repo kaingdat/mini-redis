@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use bytes::Bytes;
 use dashmap::DashMap;
 use rand::RngExt;
@@ -78,12 +76,9 @@ impl ServerConfig {
         }
     }
 
-    pub fn rdb_path(&self) -> PathBuf {
-        std::path::Path::new(&self.dir).join(&self.dbfilename)
-    }
-
     pub fn load_rdb(&mut self) {
-        let raw = std::fs::read(&self.rdb_path()).unwrap();
+        let rdb_path = std::path::Path::new(&self.dir).join(&self.dbfilename);
+        let raw = std::fs::read(rdb_path).unwrap();
         self.rdb = Bytes::from(raw);
     }
 }
