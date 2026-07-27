@@ -1,6 +1,6 @@
 use std::io;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use memchr::memchr;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -23,7 +23,38 @@ impl From<std::io::Error> for RESPError {
 }
 
 #[derive(Default)]
-pub struct RespParser;
+pub struct RespParser {
+    expect_rdb: bool,
+}
+
+impl RespParser {
+    pub fn expect_rdb(&mut self) {
+        self.expect_rdb = true;
+    }
+
+    fn decode_rdb(&mut self, buf: &mut BytesMut) -> Result<Option<RedisValueRef>, RESPError> {
+        if buf[0] != b'$' {
+            return Err(RESPError::UnknownStartingByte);
+        }
+
+        let Some((pos, size)) = int(buf, 1)? else {
+            return Ok(None);
+        };
+        if size < 0 {
+            return Err(RESPError::BadBulkStringSize(size));
+        }
+
+        let size = size as usize;
+        if buf.len() < pos + size {
+            return Ok(None);
+        }
+
+        buf.advance(pos);
+        let payload = buf.split_to(size).freeze();
+        self.expect_rdb = false;
+        Ok(Some(RedisValueRef::Raw(payload)))
+    }
+}
 
 type RedisResult = Result<Option<(usize, RedisBufSplit)>, RESPError>;
 
@@ -71,7 +102,7 @@ fn word(buf: &BytesMut, pos: usize) -> Option<(usize, BufSplit)> {
         return None;
     }
     memchr(b'\r', &buf[pos..]).and_then(|end| {
-        if end + 1 < buf.len() {
+        if pos + end + 1 < buf.len() {
             Some((pos + end + 2, BufSplit(pos, pos + end)))
         } else {
             None
@@ -142,7 +173,7 @@ fn array(buf: &BytesMut, pos: usize) -> RedisResult {
 }
 
 fn parse(buf: &BytesMut, pos: usize) -> RedisResult {
-    if buf.is_empty() {
+    if buf.len() <= pos {
         return Ok(None);
     }
 
@@ -164,6 +195,10 @@ impl Decoder for RespParser {
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if buf.is_empty() {
             return Ok(None);
+        }
+
+        if self.expect_rdb {
+            return self.decode_rdb(buf);
         }
 
         match parse(buf, 0)? {
