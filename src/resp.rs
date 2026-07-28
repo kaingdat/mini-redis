@@ -226,6 +226,12 @@ pub fn encode_command(parts: &[RedisValueRef]) -> Bytes {
     buf.freeze()
 }
 
+pub fn encoded_len(value: &RedisValueRef) -> usize {
+    let mut buf = BytesMut::new();
+    write_redis_value(value.clone(), &mut buf);
+    buf.len()
+}
+
 fn write_redis_value(item: RedisValueRef, dst: &mut BytesMut) {
     match item {
         RedisValueRef::Error(e) => {
