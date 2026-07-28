@@ -10,8 +10,8 @@ use tokio::{net::TcpStream, sync::mpsc};
 use tokio_util::codec::Framed;
 
 use crate::{
-    command::handle_command,
-    resp::RespParser,
+    command::{handle_command, is_getack_command},
+    resp::{RespParser, encoded_len},
     server::{ReplicaRegistry, Role, ServerConfig},
     types::RedisValueRef,
     value::ValueEntry,
@@ -61,12 +61,25 @@ pub async fn replicate_from_master(
 
     let mut framed = handshake(host, *port, config.port).await?;
 
+    let mut offset: u64 = 0;
+
     while let Some(incoming) = framed.next().await {
         let Ok(value) = incoming else {
             return Err(anyhow::anyhow!("failed to parse command from master"));
         };
 
-        handle_command(&value, storage, config, replicas);
+        let consumed = encoded_len(&value) as u64;
+
+        if is_getack_command(&value) {
+            let offset_str = offset.to_string();
+            framed
+                .send(resp_command(&[b"REPLCONF", b"ACK", offset_str.as_bytes()]))
+                .await?;
+        } else {
+            handle_command(&value, storage, config, replicas);
+        }
+
+        offset += consumed;
     }
 
     Ok(())

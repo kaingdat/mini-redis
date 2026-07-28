@@ -58,6 +58,14 @@ pub fn is_psync_command(value: &RedisValueRef) -> bool {
     matches!(value, RedisValueRef::Array(parts) if matches!(parts.first(), Some(RedisValueRef::BulkString(cmd)) if cmd.eq_ignore_ascii_case(b"PSYNC")))
 }
 
+pub fn is_getack_command(value: &RedisValueRef) -> bool {
+    let RedisValueRef::Array(parts) = value else {
+        return false;
+    };
+    matches!(parts.first(), Some(RedisValueRef::BulkString(cmd)) if cmd.eq_ignore_ascii_case(b"REPLCONF"))
+        && matches!(parts.get(1), Some(RedisValueRef::BulkString(sub)) if sub.eq_ignore_ascii_case(b"GETACK"))
+}
+
 const WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding wrong type value";
 
 fn require_bulk(parts: &[RedisValueRef], i: usize) -> Result<&Bytes, RedisValueRef> {
