@@ -6,8 +6,7 @@ use dashmap::DashMap;
 use tokio::time::Instant;
 
 use crate::{
-    resp::encode_command,
-    server::{ReplicaRegistry, ServerConfig},
+    server::{ReplicationState, ServerConfig},
     types::RedisValueRef,
     value::{RedisValue, SortedSetData, ValueEntry},
 };
@@ -27,6 +26,7 @@ enum Command {
     Info,
     ReplConf,
     Psync,
+    Wait,
 }
 
 impl Command {
@@ -45,6 +45,7 @@ impl Command {
             b"INFO" => Self::Info,
             b"REPLCONF" => Self::ReplConf,
             b"PSYNC" => Self::Psync,
+            b"WAIT" => Self::Wait,
             _ => return None,
         })
     }
@@ -64,6 +65,25 @@ pub fn is_getack_command(value: &RedisValueRef) -> bool {
     };
     matches!(parts.first(), Some(RedisValueRef::BulkString(cmd)) if cmd.eq_ignore_ascii_case(b"REPLCONF"))
         && matches!(parts.get(1), Some(RedisValueRef::BulkString(sub)) if sub.eq_ignore_ascii_case(b"GETACK"))
+}
+
+pub fn parse_ack_offset(value: &RedisValueRef) -> Option<u64> {
+    let RedisValueRef::Array(parts) = value else {
+        return None;
+    };
+    let RedisValueRef::BulkString(cmd) = parts.first()? else {
+        return None;
+    };
+    let RedisValueRef::BulkString(sub) = parts.get(1)? else {
+        return None;
+    };
+    if !cmd.eq_ignore_ascii_case(b"REPLCONF") || !sub.eq_ignore_ascii_case(b"ACK") {
+        return None;
+    }
+    let RedisValueRef::BulkString(offset) = parts.get(2)? else {
+        return None;
+    };
+    std::str::from_utf8(offset).ok()?.parse().ok()
 }
 
 const WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding wrong type value";
@@ -109,11 +129,11 @@ macro_rules! arity {
     };
 }
 
-pub fn handle_command(
+pub async fn handle_command(
     value: &RedisValueRef,
     storage: &Arc<DashMap<Bytes, ValueEntry>>,
     config: &Arc<ServerConfig>,
-    replicas: &Arc<ReplicaRegistry>,
+    replication: &Arc<ReplicationState>,
 ) -> RedisValueRef {
     let RedisValueRef::Array(parts) = value else {
         return RedisValueRef::ErrorMsg(b"ERR expected array command".to_vec());
@@ -144,24 +164,65 @@ pub fn handle_command(
         Command::ZCard => handle_zcard(parts, storage),
         Command::ZScore => handle_zscore(parts, storage),
         Command::ZRem => handle_zrem(parts, storage),
-        Command::Info => handle_info(parts, config),
+        Command::Info => handle_info(parts, config, replication),
         Command::ReplConf => handle_replconf(),
-        Command::Psync => handle_psync(parts, config),
+        Command::Psync => handle_psync(parts, config, replication),
+        Command::Wait => handle_wait(parts, replication).await,
     };
 
     if command.is_write() {
-        propagate(parts, replicas);
+        replication.propagate(parts);
     }
 
     response
 }
 
-fn propagate(parts: &[RedisValueRef], replicas: &Arc<ReplicaRegistry>) {
-    if replicas.is_empty() {
-        return;
+async fn handle_wait(
+    parts: &[RedisValueRef],
+    replication: &Arc<ReplicationState>,
+) -> RedisValueRef {
+    arity!(parts, "wait", == 3);
+
+    let numreplicas = match parse_i64(parts, 1) {
+        Ok(v) => v.max(0) as usize,
+        Err(e) => return e,
+    };
+    let timeout_ms = match parse_i64(parts, 2) {
+        Ok(v) => v.max(0) as u64,
+        Err(e) => return e,
+    };
+
+    let target = replication.master_offset();
+    if target == 0 {
+        return RedisValueRef::Int(replication.replica_count() as i64);
     }
-    let encoded = encode_command(parts);
-    replicas.retain(|_, tx| tx.send(encoded.clone()).is_ok());
+
+    let mut acked = replication.acked_count(target);
+    if acked >= numreplicas {
+        return RedisValueRef::Int(acked as i64);
+    }
+
+    replication.request_acks();
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let notified = replication.ack_notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        acked = replication.acked_count(target);
+        if acked >= numreplicas {
+            break;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+            acked = replication.acked_count(target);
+            break;
+        }
+    }
+
+    RedisValueRef::Int(acked as i64)
 }
 
 fn handle_get(parts: &[RedisValueRef], storage: &Arc<DashMap<Bytes, ValueEntry>>) -> RedisValueRef {
@@ -454,7 +515,11 @@ fn handle_zrem(
     RedisValueRef::Int(removed as i64)
 }
 
-fn handle_info(_parts: &[RedisValueRef], config: &Arc<ServerConfig>) -> RedisValueRef {
+fn handle_info(
+    _parts: &[RedisValueRef],
+    config: &Arc<ServerConfig>,
+    replication: &Arc<ReplicationState>,
+) -> RedisValueRef {
     let body = format!(
         "# Replication\r\n\
          role:{}\r\n\
@@ -462,7 +527,7 @@ fn handle_info(_parts: &[RedisValueRef], config: &Arc<ServerConfig>) -> RedisVal
          master_repl_offset:{}\r\n",
         config.role.name(),
         config.replid,
-        config.repl_offset,
+        replication.master_offset(),
     );
     RedisValueRef::BulkString(Bytes::from(body))
 }
@@ -471,11 +536,20 @@ fn handle_replconf() -> RedisValueRef {
     RedisValueRef::SimpleString(Bytes::from_static(b"OK"))
 }
 
-fn handle_psync(_parts: &[RedisValueRef], config: &Arc<ServerConfig>) -> RedisValueRef {
+fn handle_psync(
+    _parts: &[RedisValueRef],
+    config: &Arc<ServerConfig>,
+    replication: &Arc<ReplicationState>,
+) -> RedisValueRef {
     let mut out = BytesMut::new();
 
     out.extend_from_slice(
-        format!("+FULLRESYNC {} {}\r\n", config.replid, config.repl_offset).as_bytes(),
+        format!(
+            "+FULLRESYNC {} {}\r\n",
+            config.replid,
+            replication.master_offset()
+        )
+        .as_bytes(),
     );
 
     out.extend_from_slice(format!("${}\r\n", config.rdb.len()).as_bytes());

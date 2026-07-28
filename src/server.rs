@@ -1,9 +1,91 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::Bytes;
 use dashmap::DashMap;
 use rand::RngExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
-pub type ReplicaRegistry = DashMap<u64, mpsc::UnboundedSender<Bytes>>;
+use crate::{resp::encode_command, types::RedisValueRef};
+
+pub struct ReplicaHandle {
+    tx: mpsc::UnboundedSender<Bytes>,
+    acked_offset: AtomicU64,
+}
+
+#[derive(Default)]
+pub struct ReplicationState {
+    replicas: DashMap<u64, ReplicaHandle>,
+    master_offset: AtomicU64,
+    next_conn_id: AtomicU64,
+    ack_notify: Notify,
+}
+
+impl ReplicationState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self) -> (u64, mpsc::UnboundedReceiver<Bytes>) {
+        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.replicas.insert(
+            conn_id,
+            ReplicaHandle {
+                tx,
+                acked_offset: AtomicU64::new(0),
+            },
+        );
+        (conn_id, rx)
+    }
+
+    pub fn unregister(&self, conn_id: u64) {
+        self.replicas.remove(&conn_id);
+        self.ack_notify.notify_waiters();
+    }
+
+    pub fn replica_count(&self) -> usize {
+        self.replicas.len()
+    }
+
+    pub fn master_offset(&self) -> u64 {
+        self.master_offset.load(Ordering::SeqCst)
+    }
+
+    pub fn propagate(&self, parts: &[RedisValueRef]) {
+        let encoded = encode_command(parts);
+        self.master_offset
+            .fetch_add(encoded.len() as u64, Ordering::SeqCst);
+        self.replicas
+            .retain(|_, handle| handle.tx.send(encoded.clone()).is_ok());
+    }
+
+    pub fn request_acks(&self) {
+        let getack = [
+            RedisValueRef::BulkString(Bytes::from_static(b"REPLCONF")),
+            RedisValueRef::BulkString(Bytes::from_static(b"GETACK")),
+            RedisValueRef::BulkString(Bytes::from_static(b"*")),
+        ];
+        self.propagate(&getack);
+    }
+
+    pub fn record_ack(&self, conn_id: u64, offset: u64) {
+        if let Some(handle) = self.replicas.get(&conn_id) {
+            handle.acked_offset.fetch_max(offset, Ordering::SeqCst);
+        }
+        self.ack_notify.notify_waiters();
+    }
+
+    pub fn acked_count(&self, target: u64) -> usize {
+        self.replicas
+            .iter()
+            .filter(|handle| handle.acked_offset.load(Ordering::SeqCst) >= target)
+            .count()
+    }
+
+    pub fn ack_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.ack_notify.notified()
+    }
+}
 
 pub enum Role {
     Master,
@@ -23,7 +105,6 @@ pub struct ServerConfig {
     pub port: u16,
     pub role: Role,
     pub replid: String,
-    pub repl_offset: u64,
     pub dir: String,
     pub dbfilename: String,
     pub rdb: Bytes,
@@ -69,7 +150,6 @@ impl ServerConfig {
             port,
             role,
             replid: generate_replid(),
-            repl_offset: 0,
             dir,
             dbfilename,
             rdb: Bytes::new(),
