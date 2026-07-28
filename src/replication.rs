@@ -1,36 +1,34 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use tokio::{net::TcpStream, sync::mpsc};
+use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 use crate::{
-    command::{handle_command, is_getack_command},
+    command::{handle_command, is_getack_command, parse_ack_offset},
     resp::{RespParser, encoded_len},
-    server::{ReplicaRegistry, Role, ServerConfig},
+    server::{ReplicationState, Role, ServerConfig},
     types::RedisValueRef,
     value::ValueEntry,
 };
 
 pub async fn stream_to_replica(
     mut framed: Framed<TcpStream, RespParser>,
-    replicas: &Arc<ReplicaRegistry>,
-    next_conn_id: &Arc<AtomicU64>,
+    replication: &Arc<ReplicationState>,
 ) {
-    let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
-    replicas.insert(conn_id, tx);
+    let (conn_id, mut rx) = replication.register();
 
     loop {
         tokio::select! {
             incoming = framed.next() => {
                 match incoming {
-                    Some(Ok(_)) => {}
+                    Some(Ok(value)) => {
+                        if let Some(offset) = parse_ack_offset(&value) {
+                            replication.record_ack(conn_id, offset);
+                        }
+                    }
                     _ => break,
                 }
             }
@@ -47,13 +45,13 @@ pub async fn stream_to_replica(
         }
     }
 
-    replicas.remove(&conn_id);
+    replication.unregister(conn_id);
 }
 
 pub async fn replicate_from_master(
     config: &Arc<ServerConfig>,
     storage: &Arc<DashMap<Bytes, ValueEntry>>,
-    replicas: &Arc<ReplicaRegistry>,
+    replication: &Arc<ReplicationState>,
 ) -> anyhow::Result<()> {
     let Role::Replica { host, port } = &config.role else {
         return Ok(());
@@ -76,7 +74,7 @@ pub async fn replicate_from_master(
                 .send(resp_command(&[b"REPLCONF", b"ACK", offset_str.as_bytes()]))
                 .await?;
         } else {
-            handle_command(&value, storage, config, replicas);
+            handle_command(&value, storage, config, replication).await;
         }
 
         offset += consumed;

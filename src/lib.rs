@@ -10,7 +10,7 @@ pub mod prelude {
         command::{handle_command, is_psync_command},
         replication::{replicate_from_master, stream_to_replica},
         resp::RespParser,
-        server::{ReplicaRegistry, Role, ServerConfig},
+        server::{ReplicationState, Role, ServerConfig},
         value::ValueEntry,
     };
 }
