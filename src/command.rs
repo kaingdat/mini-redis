@@ -204,7 +204,8 @@ async fn handle_wait(
 
     replication.request_acks();
 
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    // A timeout of 0 means block until numreplicas have acked.
+    let deadline = (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms));
     loop {
         let notified = replication.ack_notified();
         tokio::pin!(notified);
@@ -214,6 +215,11 @@ async fn handle_wait(
         if acked >= numreplicas {
             break;
         }
+
+        let Some(deadline) = deadline else {
+            notified.await;
+            continue;
+        };
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
