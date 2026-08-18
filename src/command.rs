@@ -207,9 +207,10 @@ async fn handle_wait(
     // A timeout of 0 means block until numreplicas have acked.
     let deadline = (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms));
     loop {
+        // Constructed before the count check on purpose: a `Notified` records
+        // the `notify_waiters` counter at construction, so a notification that
+        // lands between here and the await is still observed by the first poll.
         let notified = replication.ack_notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
 
         acked = replication.acked_count(target);
         if acked >= numreplicas {
