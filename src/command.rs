@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use tokio::time::Instant;
 
 use crate::{
-    server::{ReplicationState, ServerConfig},
+    server::{EMPTY_RDB, ReplicationState, ServerConfig},
     types::RedisValueRef,
     value::{RedisValue, SortedSetData, ValueEntry},
 };
@@ -27,6 +27,8 @@ enum Command {
     ReplConf,
     Psync,
     Wait,
+    Config,
+    Keys,
 }
 
 impl Command {
@@ -46,6 +48,8 @@ impl Command {
             b"REPLCONF" => Self::ReplConf,
             b"PSYNC" => Self::Psync,
             b"WAIT" => Self::Wait,
+            b"CONFIG" => Self::Config,
+            b"KEYS" => Self::Keys,
             _ => return None,
         })
     }
@@ -168,6 +172,8 @@ pub async fn handle_command(
         Command::ReplConf => handle_replconf(),
         Command::Psync => handle_psync(parts, config, replication),
         Command::Wait => handle_wait(parts, replication).await,
+        Command::Config => handle_config(parts, config),
+        Command::Keys => handle_keys(parts, storage),
     };
 
     if command.is_write() {
@@ -175,6 +181,64 @@ pub async fn handle_command(
     }
 
     response
+}
+
+fn handle_config(parts: &[RedisValueRef], config: &ServerConfig) -> RedisValueRef {
+    arity!(parts, "config", >= 3);
+    let sub = match require_bulk(parts, 1) {
+        Ok(sub) => sub,
+        Err(e) => return e,
+    };
+    if !sub.eq_ignore_ascii_case(b"GET") {
+        return RedisValueRef::ErrorMsg(
+            format!(
+                "ERR Unknown CONFIG subcommand or wrong number of arguments for '{}'",
+                String::from_utf8_lossy(sub)
+            )
+            .into_bytes(),
+        );
+    }
+
+    let mut result = Vec::new();
+    for name in &parts[2..] {
+        let RedisValueRef::BulkString(name) = name else {
+            continue;
+        };
+        let value = if name.eq_ignore_ascii_case(b"dir") {
+            Some(config.dir.as_str())
+        } else if name.eq_ignore_ascii_case(b"dbfilename") {
+            Some(config.dbfilename.as_str())
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            result.push(RedisValueRef::BulkString(name.clone()));
+            result.push(RedisValueRef::BulkString(Bytes::copy_from_slice(
+                value.as_bytes(),
+            )));
+        }
+    }
+    RedisValueRef::Array(result)
+}
+
+fn handle_keys(parts: &[RedisValueRef], storage: &DashMap<Bytes, ValueEntry>) -> RedisValueRef {
+    arity!(parts, "keys", == 2);
+    let pattern = match require_bulk(parts, 1) {
+        Ok(pattern) => pattern,
+        Err(e) => return e,
+    };
+    if pattern.as_ref() != b"*" {
+        return RedisValueRef::Array(vec![]);
+    }
+
+    // Do not mutate a DashMap while its iterator holds shard locks.
+    RedisValueRef::Array(
+        storage
+            .iter()
+            .filter(|entry| !entry.is_expired())
+            .map(|entry| RedisValueRef::BulkString(entry.key().clone()))
+            .collect(),
+    )
 }
 
 async fn handle_wait(
@@ -559,8 +623,64 @@ fn handle_psync(
         .as_bytes(),
     );
 
-    out.extend_from_slice(format!("${}\r\n", config.rdb.len()).as_bytes());
-    out.extend_from_slice(&config.rdb);
+    out.extend_from_slice(format!("${}\r\n", EMPTY_RDB.len()).as_bytes());
+    out.extend_from_slice(EMPTY_RDB);
 
     RedisValueRef::Raw(out.freeze())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bulk(value: &'static [u8]) -> RedisValueRef {
+        RedisValueRef::BulkString(Bytes::from_static(value))
+    }
+
+    #[test]
+    fn keys_lists_live_strings_and_omits_expired_entries() {
+        let storage = DashMap::new();
+        storage.insert(
+            Bytes::from_static(b"live"),
+            ValueEntry::new(RedisValue::String(Bytes::from_static(b"1")), None),
+        );
+        storage.insert(
+            Bytes::from_static(b"expired"),
+            ValueEntry::new(
+                RedisValue::String(Bytes::from_static(b"2")),
+                Some(Instant::now() - Duration::from_millis(1)),
+            ),
+        );
+        let parts = vec![bulk(b"KEYS"), bulk(b"*")];
+        let RedisValueRef::Array(keys) = handle_keys(&parts, &storage) else {
+            panic!("expected array")
+        };
+        assert_eq!(keys.len(), 1);
+        assert!(matches!(&keys[0], RedisValueRef::BulkString(key) if key == b"live".as_slice()));
+
+        let parts = vec![bulk(b"KEYS"), bulk(b"l*")];
+        assert!(
+            matches!(handle_keys(&parts, &storage), RedisValueRef::Array(keys) if keys.is_empty())
+        );
+    }
+
+    #[test]
+    fn config_get_returns_known_parameters() {
+        let config = ServerConfig {
+            port: 6379,
+            role: crate::server::Role::Master,
+            replid: String::new(),
+            dir: "/tmp/data".into(),
+            dbfilename: "dump.rdb".into(),
+        };
+        let parts = vec![
+            bulk(b"CONFIG"),
+            bulk(b"GET"),
+            bulk(b"dir"),
+            bulk(b"unknown"),
+        ];
+        assert!(
+            matches!(handle_config(&parts, &config), RedisValueRef::Array(values) if values.len() == 2)
+        );
+    }
 }
