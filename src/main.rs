@@ -11,11 +11,10 @@ use codecrafters_redis::prelude::*;
 
 #[tokio::main]
 async fn main() {
-    let mut config = ServerConfig::from_args();
-    config.load_rdb();
-    let config = Arc::new(config);
-    let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
+    let config = Arc::new(ServerConfig::from_args());
     let storage = Arc::new(DashMap::<Bytes, ValueEntry>::new());
+    load_into(&config.rdb_path(), &storage);
+    let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
     let replication = Arc::new(ReplicationState::new());
 
     if matches!(config.role, Role::Replica { .. }) {

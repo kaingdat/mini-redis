@@ -7,6 +7,8 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::{resp::encode_command, types::RedisValueRef};
 
+pub const EMPTY_RDB: &[u8] = include_bytes!("../assets/empty.rdb");
+
 pub struct ReplicaHandle {
     tx: mpsc::UnboundedSender<Bytes>,
     acked_offset: AtomicU64,
@@ -107,7 +109,6 @@ pub struct ServerConfig {
     pub replid: String,
     pub dir: String,
     pub dbfilename: String,
-    pub rdb: Bytes,
 }
 
 impl ServerConfig {
@@ -115,7 +116,7 @@ impl ServerConfig {
         let mut port = 6379;
         let mut role = Role::Master;
         let mut dir = ".".to_string();
-        let mut dbfilename = "empty.rdb".to_string();
+        let mut dbfilename = "dump.rdb".to_string();
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -152,14 +153,11 @@ impl ServerConfig {
             replid: generate_replid(),
             dir,
             dbfilename,
-            rdb: Bytes::new(),
         }
     }
 
-    pub fn load_rdb(&mut self) {
-        let rdb_path = std::path::Path::new(&self.dir).join(&self.dbfilename);
-        let raw = std::fs::read(rdb_path).unwrap();
-        self.rdb = Bytes::from(raw);
+    pub fn rdb_path(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.dir).join(&self.dbfilename)
     }
 }
 
