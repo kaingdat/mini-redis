@@ -109,14 +109,24 @@ pub struct ServerConfig {
     pub replid: String,
     pub dir: String,
     pub dbfilename: String,
+    pub appendonly: String,
+    pub appenddirname: String,
+    pub appendfilename: String,
+    pub appendfsync: String,
 }
 
 impl ServerConfig {
     pub fn from_args() -> Self {
         let mut port = 6379;
         let mut role = Role::Master;
-        let mut dir = ".".to_string();
+        let mut dir = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string());
         let mut dbfilename = "dump.rdb".to_string();
+        let mut appendonly = "no".to_string();
+        let mut appenddirname = "appendonlydir".to_string();
+        let mut appendfilename = "appendonly.aof".to_string();
+        let mut appendfsync = "everysec".to_string();
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -143,7 +153,33 @@ impl ServerConfig {
                 }
                 "--dir" => dir = args.next().expect("--dir requires a value"),
                 "--dbfilename" => dbfilename = args.next().expect("--dbfilename requires a value"),
+                "--appendonly" => appendonly = args.next().expect("--appendonly requires a value"),
+                "--appenddirname" => {
+                    appenddirname = args.next().expect("--appenddirname requires a value")
+                }
+                "--appendfilename" => {
+                    appendfilename = args.next().expect("--appendfilename requires a value")
+                }
+                "--appendfsync" => {
+                    appendfsync = args.next().expect("--appendfsync requires a value")
+                }
                 _ => {}
+            }
+        }
+
+        for (flag, value, allowed) in [
+            ("--appendonly", &appendonly, &["yes", "no"][..]),
+            (
+                "--appendfsync",
+                &appendfsync,
+                &["always", "everysec", "no"][..],
+            ),
+        ] {
+            if !allowed.iter().any(|a| value.eq_ignore_ascii_case(a)) {
+                panic!(
+                    "{flag} must be one of {}, got {value:?}",
+                    allowed.join(", ")
+                );
             }
         }
 
@@ -153,11 +189,23 @@ impl ServerConfig {
             replid: generate_replid(),
             dir,
             dbfilename,
+            appendonly,
+            appenddirname,
+            appendfilename,
+            appendfsync,
         }
     }
 
     pub fn rdb_path(&self) -> std::path::PathBuf {
         std::path::Path::new(&self.dir).join(&self.dbfilename)
+    }
+
+    pub fn aof_enabled(&self) -> bool {
+        self.appendonly.eq_ignore_ascii_case("yes")
+    }
+
+    pub fn aof_dir(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.dir).join(&self.appenddirname)
     }
 }
 

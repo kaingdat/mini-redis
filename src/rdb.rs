@@ -251,10 +251,18 @@ pub fn parse(bytes: &[u8]) -> (Vec<Record>, Option<RdbError>) {
 /// `now` and `now_ms` must be sampled once for the whole load and describe the
 /// same instant on the monotonic and wall clocks; taking a fresh `Instant::now()`
 /// per key would stretch every deadline by however long the load has been running.
-fn to_deadline(expires_at_ms: u64, now_ms: u64, now: Instant) -> Option<Instant> {
+pub(crate) fn to_deadline(expires_at_ms: u64, now_ms: u64, now: Instant) -> Option<Instant> {
     (expires_at_ms > now_ms)
         .then(|| now.checked_add(Duration::from_millis(expires_at_ms - now_ms)))
         .flatten()
+}
+
+pub(crate) fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 pub fn load_into(path: &Path, storage: &DashMap<Bytes, ValueEntry>) {
@@ -267,11 +275,7 @@ pub fn load_into(path: &Path, storage: &DashMap<Bytes, ValueEntry>) {
         }
     };
     let now = Instant::now();
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64;
+    let now_ms = unix_time_ms();
     let (records, error) = parse(&bytes);
     for record in records {
         if let Record::Entry {
@@ -417,7 +421,9 @@ mod tests {
         assert!(parse(&lfu).1.is_none());
         assert!(storage.contains_key(b"k".as_slice()));
 
-        let mut lru = vec![0xfe, 0x00, 0xfb, 0x02, 0x01, 0xf8, 0x00, 0x00, 0x01, b'k', 0x01, b'v'];
+        let mut lru = vec![
+            0xfe, 0x00, 0xfb, 0x02, 0x01, 0xf8, 0x00, 0x00, 0x01, b'k', 0x01, b'v',
+        ];
         lru.push(0xfc);
         lru.extend_from_slice(&0x0000_01a0_17fd_81cf_u64.to_le_bytes());
         lru.extend_from_slice(&[0xf8, 0x00, 0x00, 0x07]);
@@ -428,7 +434,9 @@ mod tests {
         let keys: Vec<_> = records
             .iter()
             .filter_map(|r| match r {
-                Record::Entry { key, expires_at_ms, .. } => Some((key.clone(), *expires_at_ms)),
+                Record::Entry {
+                    key, expires_at_ms, ..
+                } => Some((key.clone(), *expires_at_ms)),
                 _ => None,
             })
             .collect();

@@ -13,7 +13,15 @@ use codecrafters_redis::prelude::*;
 async fn main() {
     let config = Arc::new(ServerConfig::from_args());
     let storage = Arc::new(DashMap::<Bytes, ValueEntry>::new());
-    load_into(&config.rdb_path(), &storage);
+    let aof = Arc::new(Aof::open(&config).expect("failed to initialize append-only files"));
+    if config.aof_enabled() {
+        aof.replay(&storage, &config)
+            .await
+            .expect("failed to replay append-only file");
+    } else {
+        load_into(&config.rdb_path(), &storage);
+    }
+    aof.spawn_flusher();
     let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
     let replication = Arc::new(ReplicationState::new());
 
@@ -21,8 +29,9 @@ async fn main() {
         let config = Arc::clone(&config);
         let storage = Arc::clone(&storage);
         let replication = Arc::clone(&replication);
+        let aof = Arc::clone(&aof);
         tokio::spawn(async move {
-            if let Err(e) = replicate_from_master(&config, &storage, &replication).await {
+            if let Err(e) = replicate_from_master(&config, &storage, &replication, &aof).await {
                 eprintln!("failed to replicate from master: {}", e);
             }
         });
@@ -34,12 +43,13 @@ async fn main() {
                 let storage = Arc::clone(&storage);
                 let config = Arc::clone(&config);
                 let replication = Arc::clone(&replication);
+                let aof = Arc::clone(&aof);
                 tokio::spawn(async move {
                     let mut framed = Framed::new(stream, RespParser::default());
                     while let Some(Ok(value)) = framed.next().await {
                         let is_replica = is_psync_command(&value);
                         let response =
-                            handle_command(&value, &storage, &config, &replication).await;
+                            handle_command(&value, &storage, &config, &replication, &aof).await;
                         if framed.send(response).await.is_err() {
                             break;
                         }

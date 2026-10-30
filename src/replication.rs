@@ -7,6 +7,7 @@ use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 use crate::{
+    aof::Aof,
     command::{handle_command, is_getack_command, parse_ack_offset},
     resp::{RespParser, encoded_len},
     server::{ReplicationState, Role, ServerConfig},
@@ -52,6 +53,7 @@ pub async fn replicate_from_master(
     config: &Arc<ServerConfig>,
     storage: &Arc<DashMap<Bytes, ValueEntry>>,
     replication: &Arc<ReplicationState>,
+    aof: &Arc<Aof>,
 ) -> anyhow::Result<()> {
     let Role::Replica { host, port } = &config.role else {
         return Ok(());
@@ -74,7 +76,7 @@ pub async fn replicate_from_master(
                 .send(resp_command(&[b"REPLCONF", b"ACK", offset_str.as_bytes()]))
                 .await?;
         } else {
-            handle_command(&value, storage, config, replication).await;
+            handle_command(&value, storage, config, replication, aof).await;
         }
 
         offset += consumed;

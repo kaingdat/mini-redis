@@ -1,3 +1,4 @@
+pub mod aof;
 pub mod command;
 pub mod rdb;
 pub mod replication;
@@ -8,6 +9,7 @@ pub mod value;
 
 pub mod prelude {
     pub use crate::{
+        aof::Aof,
         command::{handle_command, is_psync_command},
         rdb::load_into,
         replication::{replicate_from_master, stream_to_replica},
