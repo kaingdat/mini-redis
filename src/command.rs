@@ -1,4 +1,3 @@
-use core::f64;
 use std::{sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
@@ -6,10 +5,14 @@ use dashmap::DashMap;
 use tokio::time::Instant;
 
 use crate::{
+    aof::Aof,
+    rdb::{to_deadline, unix_time_ms},
     server::{EMPTY_RDB, ReplicationState, ServerConfig},
     types::RedisValueRef,
     value::{RedisValue, SortedSetData, ValueEntry},
 };
+
+type WriteHandler = fn(&[RedisValueRef], &Arc<DashMap<Bytes, ValueEntry>>) -> RedisValueRef;
 
 #[derive(Clone, Copy)]
 enum Command {
@@ -54,8 +57,13 @@ impl Command {
         })
     }
 
-    fn is_write(&self) -> bool {
-        matches!(self, Command::Set | Command::ZAdd | Command::ZRem)
+    fn write_handler(&self) -> Option<WriteHandler> {
+        match self {
+            Command::Set => Some(handle_set),
+            Command::ZAdd => Some(handle_zadd),
+            Command::ZRem => Some(handle_zrem),
+            _ => None,
+        }
     }
 }
 
@@ -138,6 +146,7 @@ pub async fn handle_command(
     storage: &Arc<DashMap<Bytes, ValueEntry>>,
     config: &Arc<ServerConfig>,
     replication: &Arc<ReplicationState>,
+    aof: &Arc<Aof>,
 ) -> RedisValueRef {
     let RedisValueRef::Array(parts) = value else {
         return RedisValueRef::ErrorMsg(b"ERR expected array command".to_vec());
@@ -151,7 +160,16 @@ pub async fn handle_command(
         return RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec());
     };
 
-    let response = match command {
+    if let Some(handler) = command.write_handler() {
+        let response = match aof.apply(parts, || handler(parts, storage)).await {
+            Ok(response) => response,
+            Err(rejected) => return rejected,
+        };
+        replication.propagate(parts);
+        return response;
+    }
+
+    match command {
         Command::Ping => RedisValueRef::SimpleString(Bytes::from_static(b"PONG")),
         Command::Echo => {
             arity!(parts, "echo", == 2);
@@ -160,27 +178,19 @@ pub async fn handle_command(
                 Err(e) => e,
             }
         }
-        Command::Set => handle_set(parts, storage),
         Command::Get => handle_get(parts, storage),
-        Command::ZAdd => handle_zadd(parts, storage),
         Command::ZRank => handle_zrank(parts, storage),
         Command::ZRange => handle_zrange(parts, storage),
         Command::ZCard => handle_zcard(parts, storage),
         Command::ZScore => handle_zscore(parts, storage),
-        Command::ZRem => handle_zrem(parts, storage),
         Command::Info => handle_info(parts, config, replication),
         Command::ReplConf => handle_replconf(),
         Command::Psync => handle_psync(parts, config, replication),
         Command::Wait => handle_wait(parts, replication).await,
         Command::Config => handle_config(parts, config),
         Command::Keys => handle_keys(parts, storage),
-    };
-
-    if command.is_write() {
-        replication.propagate(parts);
+        Command::Set | Command::ZAdd | Command::ZRem => unreachable!("dispatched as writes above"),
     }
-
-    response
 }
 
 fn handle_config(parts: &[RedisValueRef], config: &ServerConfig) -> RedisValueRef {
@@ -208,6 +218,14 @@ fn handle_config(parts: &[RedisValueRef], config: &ServerConfig) -> RedisValueRe
             Some(config.dir.as_str())
         } else if name.eq_ignore_ascii_case(b"dbfilename") {
             Some(config.dbfilename.as_str())
+        } else if name.eq_ignore_ascii_case(b"appendonly") {
+            Some(config.appendonly.as_str())
+        } else if name.eq_ignore_ascii_case(b"appenddirname") {
+            Some(config.appenddirname.as_str())
+        } else if name.eq_ignore_ascii_case(b"appendfilename") {
+            Some(config.appendfilename.as_str())
+        } else if name.eq_ignore_ascii_case(b"appendfsync") {
+            Some(config.appendfsync.as_str())
         } else {
             None
         };
@@ -331,9 +349,13 @@ fn handle_set(parts: &[RedisValueRef], storage: &Arc<DashMap<Bytes, ValueEntry>>
             Ok(b) => b,
             Err(_) => return RedisValueRef::ErrorMsg(b"ERR syntax error".to_vec()),
         };
-        if !option.eq_ignore_ascii_case(b"PX") {
+        let absolute = if option.eq_ignore_ascii_case(b"PX") {
+            false
+        } else if option.eq_ignore_ascii_case(b"PXAT") {
+            true
+        } else {
             return RedisValueRef::ErrorMsg(b"ERR syntax error".to_vec());
-        }
+        };
         let px_bytes = match require_bulk(parts, 4) {
             Ok(b) => b,
             Err(_) => return RedisValueRef::ErrorMsg(b"ERR syntax error".to_vec()),
@@ -347,6 +369,15 @@ fn handle_set(parts: &[RedisValueRef], storage: &Arc<DashMap<Bytes, ValueEntry>>
             }
         };
         match s.parse::<i64>() {
+            Ok(ms) if ms > 0 && absolute => {
+                match to_deadline(ms as u64, unix_time_ms(), Instant::now()) {
+                    Some(deadline) => Some(deadline),
+                    None => {
+                        storage.remove(&key);
+                        return RedisValueRef::SimpleString(Bytes::from_static(b"OK"));
+                    }
+                }
+            }
             Ok(ms) if ms > 0 => Some(Instant::now() + Duration::from_millis(ms as u64)),
             Ok(_) => {
                 return RedisValueRef::ErrorMsg(
@@ -672,15 +703,47 @@ mod tests {
             replid: String::new(),
             dir: "/tmp/data".into(),
             dbfilename: "dump.rdb".into(),
+            appendonly: "no".into(),
+            appenddirname: "appendonlydir".into(),
+            appendfilename: "appendonly.aof".into(),
+            appendfsync: "everysec".into(),
         };
         let parts = vec![
             bulk(b"CONFIG"),
             bulk(b"GET"),
             bulk(b"dir"),
             bulk(b"unknown"),
+            bulk(b"appendfsync"),
         ];
         assert!(
-            matches!(handle_config(&parts, &config), RedisValueRef::Array(values) if values.len() == 2)
+            matches!(handle_config(&parts, &config), RedisValueRef::Array(values) if values.len() == 4)
         );
+    }
+
+    #[tokio::test]
+    async fn failed_writes_are_not_propagated() {
+        let storage = Arc::new(DashMap::new());
+        storage.insert(
+            Bytes::from_static(b"k"),
+            ValueEntry::new(RedisValue::String(Bytes::from_static(b"v")), None),
+        );
+        let config = Arc::new(ServerConfig {
+            port: 0,
+            role: crate::server::Role::Master,
+            replid: String::new(),
+            dir: String::new(),
+            dbfilename: String::new(),
+            appendonly: "no".into(),
+            appenddirname: String::new(),
+            appendfilename: String::new(),
+            appendfsync: "everysec".into(),
+        });
+        let replication = Arc::new(ReplicationState::new());
+        let aof = Arc::new(Aof::disabled());
+        let zadd = RedisValueRef::Array(vec![bulk(b"ZADD"), bulk(b"k"), bulk(b"1"), bulk(b"m")]);
+
+        let response = handle_command(&zadd, &storage, &config, &replication, &aof).await;
+        assert!(matches!(response, RedisValueRef::ErrorMsg(_)));
+        assert_eq!(replication.master_offset(), 0);
     }
 }
