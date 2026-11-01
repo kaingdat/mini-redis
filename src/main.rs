@@ -24,14 +24,18 @@ async fn main() {
     aof.spawn_flusher();
     let listener = TcpListener::bind(("127.0.0.1", config.port)).await.unwrap();
     let replication = Arc::new(ReplicationState::new());
+    let lock = Arc::new(ExecLock::default());
 
     if matches!(config.role, Role::Replica { .. }) {
         let config = Arc::clone(&config);
         let storage = Arc::clone(&storage);
         let replication = Arc::clone(&replication);
         let aof = Arc::clone(&aof);
+        let lock = Arc::clone(&lock);
         tokio::spawn(async move {
-            if let Err(e) = replicate_from_master(&config, &storage, &replication, &aof).await {
+            if let Err(e) =
+                replicate_from_master(&config, &storage, &replication, &aof, &lock).await
+            {
                 eprintln!("failed to replicate from master: {}", e);
             }
         });
@@ -44,12 +48,15 @@ async fn main() {
                 let config = Arc::clone(&config);
                 let replication = Arc::clone(&replication);
                 let aof = Arc::clone(&aof);
+                let lock = Arc::clone(&lock);
                 tokio::spawn(async move {
                     let mut framed = Framed::new(stream, RespParser::default());
+                    let mut session = Session::new();
                     while let Some(Ok(value)) = framed.next().await {
-                        let is_replica = is_psync_command(&value);
-                        let response =
-                            handle_command(&value, &storage, &config, &replication, &aof).await;
+                        let is_replica = !session.in_transaction() && is_psync_command(&value);
+                        let response = session
+                            .handle(&value, &storage, &config, &replication, &aof, &lock)
+                            .await;
                         if framed.send(response).await.is_err() {
                             break;
                         }
