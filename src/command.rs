@@ -74,6 +74,31 @@ pub fn is_psync_command(value: &RedisValueRef) -> bool {
     matches!(value, RedisValueRef::Array(parts) if matches!(parts.first(), Some(RedisValueRef::BulkString(cmd)) if cmd.eq_ignore_ascii_case(b"PSYNC")))
 }
 
+pub enum ConnectionCommand {
+    Quit,
+    Reset,
+    Invalid(RedisValueRef),
+}
+
+pub fn connection_command(value: &RedisValueRef) -> Option<ConnectionCommand> {
+    let RedisValueRef::Array(parts) = value else {
+        return None;
+    };
+    let Some(RedisValueRef::BulkString(name)) = parts.first() else {
+        return None;
+    };
+    if name.eq_ignore_ascii_case(b"QUIT") {
+        Some(ConnectionCommand::Quit)
+    } else if name.eq_ignore_ascii_case(b"RESET") {
+        Some(match parts.len() {
+            1 => ConnectionCommand::Reset,
+            _ => ConnectionCommand::Invalid(wrong_arity("reset")),
+        })
+    } else {
+        None
+    }
+}
+
 pub fn is_getack_command(value: &RedisValueRef) -> bool {
     let RedisValueRef::Array(parts) = value else {
         return false;
@@ -103,10 +128,14 @@ pub fn parse_ack_offset(value: &RedisValueRef) -> Option<u64> {
 
 const WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding wrong type value";
 
+pub(crate) fn invalid_argument() -> RedisValueRef {
+    RedisValueRef::ErrorMsg(b"ERR invalid argument".to_vec())
+}
+
 fn require_bulk(parts: &[RedisValueRef], i: usize) -> Result<&Bytes, RedisValueRef> {
     match parts.get(i) {
         Some(RedisValueRef::BulkString(b)) => Ok(b),
-        _ => Err(RedisValueRef::ErrorMsg(b"ERR invalid argument".to_vec())),
+        _ => Err(invalid_argument()),
     }
 }
 
@@ -120,7 +149,7 @@ fn parse_i64(parts: &[RedisValueRef], i: usize) -> Result<i64, RedisValueRef> {
         })
 }
 
-fn wrong_arity(cmd: &str) -> RedisValueRef {
+pub(crate) fn wrong_arity(cmd: &str) -> RedisValueRef {
     RedisValueRef::ErrorMsg(
         format!("ERR wrong number of arguments for '{}' command", cmd).into_bytes(),
     )

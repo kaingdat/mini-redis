@@ -9,9 +9,11 @@ use tokio_util::codec::Framed;
 use crate::{
     aof::Aof,
     command::{is_getack_command, parse_ack_offset},
+    pubsub::PubSub,
     resp::{RespParser, encoded_len},
     server::{ReplicationState, Role, ServerConfig},
-    transaction::{ExecLock, Session},
+    session::Session,
+    transaction::ExecLock,
     types::RedisValueRef,
     value::ValueEntry,
 };
@@ -56,6 +58,7 @@ pub async fn replicate_from_master(
     replication: &Arc<ReplicationState>,
     aof: &Arc<Aof>,
     lock: &ExecLock,
+    pubsub: &Arc<PubSub>,
 ) -> anyhow::Result<()> {
     let Role::Replica { host, port } = &config.role else {
         return Ok(());
@@ -64,7 +67,7 @@ pub async fn replicate_from_master(
     let mut framed = handshake(host, *port, config.port).await?;
 
     let mut offset: u64 = 0;
-    let mut session = Session::new();
+    let mut session = Session::new(Arc::clone(pubsub));
 
     while let Some(incoming) = framed.next().await {
         let Ok(value) = incoming else {

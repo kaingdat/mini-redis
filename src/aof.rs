@@ -23,7 +23,7 @@ use crate::{
     rdb::{load_into, unix_time_ms},
     resp::{RespParser, encode_command},
     server::{ReplicationState, ServerConfig},
-    types::RedisValueRef,
+    types::{RedisValueRef, bulk_static},
     value::ValueEntry,
 };
 
@@ -358,10 +358,6 @@ fn encode_transaction(writes: &[&[RedisValueRef]]) -> Bytes {
     }
     out.extend_from_slice(&encode_command(&[bulk_static(b"EXEC")]));
     out.freeze()
-}
-
-fn bulk_static(value: &'static [u8]) -> RedisValueRef {
-    RedisValueRef::BulkString(Bytes::from_static(value))
 }
 
 fn logged_form(parts: &[RedisValueRef]) -> Cow<'_, [RedisValueRef]> {
