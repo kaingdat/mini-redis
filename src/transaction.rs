@@ -6,7 +6,8 @@ use tokio::sync::RwLock;
 
 use crate::{
     aof::Aof,
-    command::{execute_queued, handle_command, is_wait_command},
+    command::execute_queued,
+    pubsub::PubSub,
     server::{ReplicationState, ServerConfig},
     types::RedisValueRef,
     value::ValueEntry,
@@ -15,7 +16,7 @@ use crate::{
 pub type ExecLock = RwLock<()>;
 
 #[derive(Default)]
-pub struct Session {
+pub(crate) struct Transaction {
     queued: Option<Vec<RedisValueRef>>,
 }
 
@@ -49,16 +50,16 @@ fn error(message: &[u8]) -> RedisValueRef {
     RedisValueRef::ErrorMsg(message.to_vec())
 }
 
-impl Session {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn in_transaction(&self) -> bool {
+impl Transaction {
+    pub(crate) fn is_active(&self) -> bool {
         self.queued.is_some()
     }
 
-    pub async fn handle(
+    pub(crate) fn discard(&mut self) {
+        self.queued = None;
+    }
+
+    pub(crate) async fn handle(
         &mut self,
         value: &RedisValueRef,
         storage: &Arc<DashMap<Bytes, ValueEntry>>,
@@ -66,8 +67,9 @@ impl Session {
         replication: &Arc<ReplicationState>,
         aof: &Arc<Aof>,
         lock: &ExecLock,
-    ) -> RedisValueRef {
-        match (control(value), &mut self.queued) {
+        pubsub: &PubSub,
+    ) -> Option<RedisValueRef> {
+        Some(match (control(value), &mut self.queued) {
             (Some(Control::Multi), Some(_)) => error(b"ERR MULTI calls can not be nested"),
             (Some(Control::Multi), None) => {
                 self.queued = Some(Vec::new());
@@ -76,7 +78,7 @@ impl Session {
             (Some(Control::Exec), None) => error(b"ERR EXEC without MULTI"),
             (Some(Control::Exec), Some(_)) => {
                 let queued = self.queued.take().unwrap();
-                exec(&queued, storage, config, replication, aof, lock).await
+                exec(&queued, storage, config, replication, aof, lock, pubsub).await
             }
             (Some(Control::Discard), None) => error(b"ERR DISCARD without MULTI"),
             (Some(Control::Discard), Some(_)) => {
@@ -91,14 +93,8 @@ impl Session {
                 queued.push(value.clone());
                 RedisValueRef::SimpleString(Bytes::from_static(b"QUEUED"))
             }
-            (None, None) => {
-                if is_wait_command(value) {
-                    return handle_command(value, storage, config, replication, aof).await;
-                }
-                let _shared = lock.read().await;
-                handle_command(value, storage, config, replication, aof).await
-            }
-        }
+            (None, None) => return None,
+        })
     }
 }
 
@@ -109,17 +105,34 @@ async fn exec(
     replication: &Arc<ReplicationState>,
     aof: &Arc<Aof>,
     lock: &ExecLock,
+    pubsub: &PubSub,
 ) -> RedisValueRef {
     let _exclusive = lock.write().await;
+    let mut propagated = Vec::new();
     let result = aof
         .apply_transaction(|| {
             let mut writes = Vec::new();
             let replies = queued
                 .iter()
                 .map(|value| {
-                    let (reply, wrote) = execute_queued(value, storage, config, replication);
-                    if wrote && let RedisValueRef::Array(parts) = value {
-                        writes.push(parts.as_slice());
+                    let (reply, logged, replicated) = match pubsub.execute_publish(value) {
+                        Some(reply) => {
+                            let ok = !matches!(reply, RedisValueRef::ErrorMsg(_));
+                            (reply, false, ok)
+                        }
+                        None => {
+                            let (reply, wrote) =
+                                execute_queued(value, storage, config, replication);
+                            (reply, wrote, wrote)
+                        }
+                    };
+                    if let RedisValueRef::Array(parts) = value {
+                        if logged {
+                            writes.push(parts.as_slice());
+                        }
+                        if replicated {
+                            propagated.push(parts.as_slice());
+                        }
                     }
                     reply
                 })
@@ -128,8 +141,8 @@ async fn exec(
         })
         .await;
     match result {
-        Ok((reply, writes)) => {
-            replication.propagate_transaction(&writes);
+        Ok((reply, _)) => {
+            replication.propagate_transaction(&propagated);
             reply
         }
         Err(rejected) => rejected,
@@ -138,74 +151,16 @@ async fn exec(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::server::Role;
+    use std::sync::Arc;
 
-    struct Server {
-        storage: Arc<DashMap<Bytes, ValueEntry>>,
-        config: Arc<ServerConfig>,
-        replication: Arc<ReplicationState>,
-        aof: Arc<Aof>,
-        lock: Arc<ExecLock>,
-    }
+    use bytes::Bytes;
 
-    impl Server {
-        fn new() -> Self {
-            Self {
-                storage: Arc::new(DashMap::new()),
-                config: Arc::new(ServerConfig {
-                    port: 0,
-                    role: Role::Master,
-                    replid: String::new(),
-                    dir: String::new(),
-                    dbfilename: String::new(),
-                    appendonly: "no".into(),
-                    appenddirname: String::new(),
-                    appendfilename: String::new(),
-                    appendfsync: "everysec".into(),
-                }),
-                replication: Arc::new(ReplicationState::new()),
-                aof: Arc::new(Aof::disabled()),
-                lock: Arc::new(ExecLock::default()),
-            }
-        }
-
-        async fn send(&self, session: &mut Session, parts: &[&str]) -> RedisValueRef {
-            let value = RedisValueRef::Array(
-                parts
-                    .iter()
-                    .map(|part| RedisValueRef::BulkString(Bytes::copy_from_slice(part.as_bytes())))
-                    .collect(),
-            );
-            session
-                .handle(
-                    &value,
-                    &self.storage,
-                    &self.config,
-                    &self.replication,
-                    &self.aof,
-                    &self.lock,
-                )
-                .await
-        }
-    }
-
-    fn simple(value: &'static str) -> RedisValueRef {
-        RedisValueRef::SimpleString(Bytes::from_static(value.as_bytes()))
-    }
-
-    fn bulk(value: &'static str) -> RedisValueRef {
-        RedisValueRef::BulkString(Bytes::from_static(value.as_bytes()))
-    }
-
-    fn err(value: &str) -> RedisValueRef {
-        RedisValueRef::ErrorMsg(value.as_bytes().to_vec())
-    }
+    use crate::{session::testing::*, types::RedisValueRef};
 
     #[tokio::test]
     async fn exec_runs_the_queue_in_order_past_failures() {
         let server = Server::new();
-        let mut session = Session::new();
+        let mut session = server.session();
         assert!(server.send(&mut session, &["MULTI"]).await == simple("OK"));
         assert!(server.send(&mut session, &["SET", "foo", "41"]).await == simple("QUEUED"));
         server.send(&mut session, &["INCR", "foo"]).await;
@@ -236,7 +191,7 @@ mod tests {
     async fn exec_waits_for_in_flight_commands() {
         let server = Server::new();
         let shared = server.lock.clone().read_owned().await;
-        let mut session = Session::new();
+        let mut session = server.session();
         server.send(&mut session, &["MULTI"]).await;
         server.send(&mut session, &["SET", "foo", "1"]).await;
 
@@ -250,5 +205,26 @@ mod tests {
         );
         drop(shared);
         assert!(exec.await == RedisValueRef::Array(vec![simple("OK")]));
+    }
+
+    #[tokio::test]
+    async fn exec_runs_queued_publish() {
+        let server = Server::new();
+        let mut subscriber = crate::pubsub::Subscriber::new(Arc::clone(&server.pubsub));
+        subscriber.handle(&RedisValueRef::Array(vec![bulk("SUBSCRIBE"), bulk("chan")]));
+
+        let mut session = server.session();
+        server.send(&mut session, &["MULTI"]).await;
+        assert!(server.send(&mut session, &["PUBLISH", "chan", "hi"]).await == simple("QUEUED"));
+        assert!(
+            server.send(&mut session, &["EXEC"]).await
+                == RedisValueRef::Array(vec![RedisValueRef::Int(1)])
+        );
+        assert_eq!(
+            subscriber.recv().await,
+            Some(Bytes::from_static(
+                b"*3\r\n$7\r\nmessage\r\n$4\r\nchan\r\n$2\r\nhi\r\n"
+            ))
+        );
     }
 }

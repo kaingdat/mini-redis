@@ -16,3 +16,7 @@ pub enum RedisValueRef {
 pub const NULL_BULK_STRING: &str = "$-1\r\n";
 pub const NULL_ARRAY: &str = "*-1\r\n";
 pub const EMPTY_ARRAY: &str = "*0\r\n";
+
+pub(crate) fn bulk_static(value: &'static [u8]) -> RedisValueRef {
+    RedisValueRef::BulkString(Bytes::from_static(value))
+}
