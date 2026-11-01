@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rand::RngExt;
 use tokio::sync::{Notify, mpsc};
@@ -54,7 +54,27 @@ impl ReplicationState {
     }
 
     pub fn propagate(&self, parts: &[RedisValueRef]) {
-        let encoded = encode_command(parts);
+        self.send(encode_command(parts));
+    }
+
+    pub fn propagate_transaction(&self, writes: &[&[RedisValueRef]]) {
+        if writes.is_empty() {
+            return;
+        }
+        let mut out = BytesMut::new();
+        out.extend_from_slice(&encode_command(&[RedisValueRef::BulkString(
+            Bytes::from_static(b"MULTI"),
+        )]));
+        for parts in writes {
+            out.extend_from_slice(&encode_command(parts));
+        }
+        out.extend_from_slice(&encode_command(&[RedisValueRef::BulkString(
+            Bytes::from_static(b"EXEC"),
+        )]));
+        self.send(out.freeze());
+    }
+
+    fn send(&self, encoded: Bytes) {
         self.master_offset
             .fetch_add(encoded.len() as u64, Ordering::SeqCst);
         self.replicas

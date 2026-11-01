@@ -221,13 +221,48 @@ impl Aof {
         parts: &[RedisValueRef],
         execute: impl FnOnce() -> RedisValueRef,
     ) -> Result<RedisValueRef, RedisValueRef> {
+        let (response, log_error) = self
+            .execute_logged(|encode| {
+                let response = execute();
+                let encoded = if !encode || is_error(&response) {
+                    Bytes::new()
+                } else {
+                    encode_command(&logged_form(parts))
+                };
+                (response, encoded)
+            })
+            .await?;
+        if is_error(&response) {
+            return Err(response);
+        }
+        Ok(log_error.unwrap_or(response))
+    }
+
+    pub async fn apply_transaction<'q>(
+        &self,
+        execute: impl FnOnce() -> (Vec<RedisValueRef>, Vec<&'q [RedisValueRef]>),
+    ) -> Result<(RedisValueRef, Vec<&'q [RedisValueRef]>), RedisValueRef> {
+        let ((replies, writes), log_error) = self
+            .execute_logged(|encode| {
+                let (replies, writes) = execute();
+                let encoded = if encode {
+                    encode_transaction(&writes)
+                } else {
+                    Bytes::new()
+                };
+                ((replies, writes), encoded)
+            })
+            .await?;
+        let reply = log_error.unwrap_or(RedisValueRef::Array(replies));
+        Ok((reply, writes))
+    }
+
+    async fn execute_logged<T>(
+        &self,
+        execute: impl FnOnce(bool) -> (T, Bytes),
+    ) -> Result<(T, Option<RedisValueRef>), RedisValueRef> {
         let Some(log) = &self.log else {
-            let response = execute();
-            return if is_error(&response) {
-                Err(response)
-            } else {
-                Ok(response)
-            };
+            return Ok((execute(false).0, None));
         };
 
         let mut file = Arc::clone(&log.file).lock_owned().await;
@@ -238,12 +273,11 @@ impl Aof {
                 return Err(misconf(&e));
             }
         }
-        let response = execute();
-        if is_error(&response) {
-            return Err(response);
+        let (value, encoded) = execute(true);
+        if encoded.is_empty() {
+            return Ok((value, None));
         }
 
-        let encoded = encode_command(&logged_form(parts));
         let sync = Arc::clone(&log.sync);
         let (file, result) = blocking(file, move |file| {
             file.append(&encoded)?;
@@ -260,7 +294,7 @@ impl Aof {
                     std::process::exit(1);
                 }
                 eprintln!("failed to append to AOF: {e}");
-                return Ok(misconf(&e));
+                return Ok((value, Some(misconf(&e))));
             }
         };
 
@@ -269,7 +303,7 @@ impl Aof {
             let mut synced = log.sync.synced.subscribe();
             let _ = synced.wait_for(|&synced| synced >= end).await;
         }
-        Ok(response)
+        Ok((value, None))
     }
 }
 
@@ -311,6 +345,23 @@ fn is_error(response: &RedisValueRef) -> bool {
 
 fn misconf(e: &io::Error) -> RedisValueRef {
     RedisValueRef::ErrorMsg(format!("MISCONF Errors writing to the AOF file: {e}").into_bytes())
+}
+
+fn encode_transaction(writes: &[&[RedisValueRef]]) -> Bytes {
+    if writes.is_empty() {
+        return Bytes::new();
+    }
+    let mut out = BytesMut::new();
+    out.extend_from_slice(&encode_command(&[bulk_static(b"MULTI")]));
+    for parts in writes {
+        out.extend_from_slice(&encode_command(&logged_form(parts)));
+    }
+    out.extend_from_slice(&encode_command(&[bulk_static(b"EXEC")]));
+    out.freeze()
+}
+
+fn bulk_static(value: &'static [u8]) -> RedisValueRef {
+    RedisValueRef::BulkString(Bytes::from_static(value))
 }
 
 fn logged_form(parts: &[RedisValueRef]) -> Cow<'_, [RedisValueRef]> {
@@ -394,24 +445,47 @@ async fn replay_file(
     let replication = Arc::new(ReplicationState::new());
     let no_aof = Arc::new(Aof::disabled());
 
+    let corrupt = |commands: usize, detail: String| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "AOF {} is corrupt after {commands} commands: {detail}",
+                path.display()
+            ),
+        )
+    };
+
     let mut commands = 0;
+    let mut transaction: Option<(Vec<RedisValueRef>, u64)> = None;
     loop {
+        let start = read - buf.len() as u64;
         match parser.decode(&mut buf) {
             Ok(Some(value)) => {
-                handle_command(&value, storage, config, &replication, &no_aof).await;
-                commands += 1;
+                match (command_name(&value), &mut transaction) {
+                    (Some(b"MULTI"), Some(_)) => {
+                        return Err(corrupt(commands, "nested MULTI".into()));
+                    }
+                    (Some(b"MULTI"), None) => transaction = Some((Vec::new(), start)),
+                    (Some(b"EXEC"), None) => {
+                        return Err(corrupt(commands, "EXEC without MULTI".into()));
+                    }
+                    (Some(b"EXEC"), Some(_)) => {
+                        let (queued, _) = transaction.take().unwrap();
+                        for value in &queued {
+                            handle_command(value, storage, config, &replication, &no_aof).await;
+                        }
+                        commands += queued.len();
+                    }
+                    (_, Some((queued, _))) => queued.push(value),
+                    (_, None) => {
+                        handle_command(&value, storage, config, &replication, &no_aof).await;
+                        commands += 1;
+                    }
+                }
                 continue;
             }
             Ok(None) => {}
-            Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "AOF {} is corrupt after {commands} commands: {e:?}",
-                        path.display()
-                    ),
-                ));
-            }
+            Err(e) => return Err(corrupt(commands, format!("{e:?}"))),
         }
         buf.reserve(64 * 1024);
         match file.read_buf(&mut buf).await? {
@@ -420,11 +494,27 @@ async fn replay_file(
         }
     }
 
+    let valid = match transaction {
+        Some((_, start)) => start,
+        None => read - buf.len() as u64,
+    };
     Ok(Replayed {
         commands,
-        valid: read - buf.len() as u64,
-        trailing: buf.len(),
+        valid,
+        trailing: (read - valid) as usize,
     })
+}
+
+fn command_name(value: &RedisValueRef) -> Option<&'static [u8]> {
+    let RedisValueRef::Array(parts) = value else {
+        return None;
+    };
+    let Some(RedisValueRef::BulkString(name)) = parts.first() else {
+        return None;
+    };
+    [b"MULTI".as_slice(), b"EXEC"]
+        .into_iter()
+        .find(|known| name.eq_ignore_ascii_case(known))
 }
 
 fn is_rdb(path: &Path) -> io::Result<bool> {
@@ -640,6 +730,33 @@ mod tests {
         let storage = Arc::new(DashMap::new());
         assert_eq!(aof.replay(&storage, &config).await.unwrap(), 2);
         assert!(storage.contains_key(b"b".as_slice()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_drops_a_transaction_without_its_exec() {
+        let (aof, dir) = open_temp("txn-tail", "everysec");
+        append(&aof, &set("a")).await;
+        let path = aof.log.as_ref().unwrap().incrs.last().unwrap().clone();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&encode_command(&command(&[b"MULTI"])))
+            .unwrap();
+        file.write_all(&encode_command(&set("b"))).unwrap();
+
+        let config = replay_config();
+        let storage = Arc::new(DashMap::new());
+        assert_eq!(aof.replay(&storage, &config).await.unwrap(), 1);
+        assert!(!storage.contains_key(b"b".as_slice()));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            encode_command(&set("a")).to_vec(),
+            "the unterminated block is truncated away"
+        );
+
+        append(&aof, &set("c")).await;
+        let storage = Arc::new(DashMap::new());
+        assert_eq!(aof.replay(&storage, &config).await.unwrap(), 2);
+        assert!(storage.contains_key(b"c".as_slice()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

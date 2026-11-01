@@ -144,6 +144,27 @@ macro_rules! arity {
     };
 }
 
+pub fn is_wait_command(value: &RedisValueRef) -> bool {
+    matches!(parse_command(value), Ok((Command::Wait, _)))
+}
+
+fn parse_command(value: &RedisValueRef) -> Result<(Command, &[RedisValueRef]), RedisValueRef> {
+    let RedisValueRef::Array(parts) = value else {
+        return Err(RedisValueRef::ErrorMsg(
+            b"ERR expected array command".to_vec(),
+        ));
+    };
+
+    let Some(RedisValueRef::BulkString(cmd)) = parts.first() else {
+        return Err(RedisValueRef::ErrorMsg(b"ERR missing command".to_vec()));
+    };
+
+    match Command::parse(cmd) {
+        Some(command) => Ok((command, parts)),
+        None => Err(RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec())),
+    }
+}
+
 pub async fn handle_command(
     value: &RedisValueRef,
     storage: &Arc<DashMap<Bytes, ValueEntry>>,
@@ -151,16 +172,9 @@ pub async fn handle_command(
     replication: &Arc<ReplicationState>,
     aof: &Arc<Aof>,
 ) -> RedisValueRef {
-    let RedisValueRef::Array(parts) = value else {
-        return RedisValueRef::ErrorMsg(b"ERR expected array command".to_vec());
-    };
-
-    let Some(RedisValueRef::BulkString(cmd)) = parts.first() else {
-        return RedisValueRef::ErrorMsg(b"ERR missing command".to_vec());
-    };
-
-    let Some(command) = Command::parse(cmd) else {
-        return RedisValueRef::ErrorMsg(b"ERR unknown command".to_vec());
+    let (command, parts) = match parse_command(value) {
+        Ok(parsed) => parsed,
+        Err(e) => return e,
     };
 
     if let Some(handler) = command.write_handler() {
@@ -172,6 +186,51 @@ pub async fn handle_command(
         return response;
     }
 
+    match command {
+        Command::Wait => handle_wait(parts, replication).await,
+        _ => handle_read(command, parts, storage, config, replication),
+    }
+}
+
+pub(crate) fn execute_queued(
+    value: &RedisValueRef,
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+    config: &Arc<ServerConfig>,
+    replication: &Arc<ReplicationState>,
+) -> (RedisValueRef, bool) {
+    let (command, parts) = match parse_command(value) {
+        Ok(parsed) => parsed,
+        Err(e) => return (e, false),
+    };
+
+    if let Some(handler) = command.write_handler() {
+        let response = handler(parts, storage);
+        let applied = !matches!(response, RedisValueRef::ErrorMsg(_));
+        return (response, applied);
+    }
+
+    let response = match command {
+        Command::Wait => match start_wait(parts, replication) {
+            Wait::Done(response) => response,
+            Wait::Block { target, .. } => {
+                RedisValueRef::Int(replication.acked_count(target) as i64)
+            }
+        },
+        Command::Psync => {
+            RedisValueRef::ErrorMsg(b"ERR Command not allowed inside a transaction".to_vec())
+        }
+        _ => handle_read(command, parts, storage, config, replication),
+    };
+    (response, false)
+}
+
+fn handle_read(
+    command: Command,
+    parts: &[RedisValueRef],
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+    config: &Arc<ServerConfig>,
+    replication: &Arc<ReplicationState>,
+) -> RedisValueRef {
     match command {
         Command::Ping => RedisValueRef::SimpleString(Bytes::from_static(b"PONG")),
         Command::Echo => {
@@ -189,11 +248,11 @@ pub async fn handle_command(
         Command::Info => handle_info(parts, config, replication),
         Command::ReplConf => handle_replconf(),
         Command::Psync => handle_psync(parts, config, replication),
-        Command::Wait => handle_wait(parts, replication).await,
         Command::Config => handle_config(parts, config),
         Command::Keys => handle_keys(parts, storage),
+        Command::Wait => unreachable!("WAIT is dispatched by the caller"),
         Command::Set | Command::Incr | Command::ZAdd | Command::ZRem => {
-            unreachable!("dispatched as writes above")
+            unreachable!("dispatched as writes by the caller")
         }
     }
 }
@@ -264,31 +323,60 @@ fn handle_keys(parts: &[RedisValueRef], storage: &DashMap<Bytes, ValueEntry>) ->
     )
 }
 
-async fn handle_wait(
-    parts: &[RedisValueRef],
-    replication: &Arc<ReplicationState>,
-) -> RedisValueRef {
-    arity!(parts, "wait", == 3);
+enum Wait {
+    Done(RedisValueRef),
+    Block {
+        target: u64,
+        numreplicas: usize,
+        timeout_ms: u64,
+    },
+}
+
+fn start_wait(parts: &[RedisValueRef], replication: &ReplicationState) -> Wait {
+    if parts.len() != 3 {
+        return Wait::Done(wrong_arity("wait"));
+    }
 
     let numreplicas = match parse_i64(parts, 1) {
         Ok(v) => v.max(0) as usize,
-        Err(e) => return e,
+        Err(e) => return Wait::Done(e),
     };
     let timeout_ms = match parse_i64(parts, 2) {
         Ok(v) => v.max(0) as u64,
-        Err(e) => return e,
+        Err(e) => return Wait::Done(e),
     };
 
     let target = replication.master_offset();
     if target == 0 {
-        return RedisValueRef::Int(replication.replica_count() as i64);
+        return Wait::Done(RedisValueRef::Int(replication.replica_count() as i64));
     }
 
-    let mut acked = replication.acked_count(target);
+    let acked = replication.acked_count(target);
     if acked >= numreplicas {
-        return RedisValueRef::Int(acked as i64);
+        return Wait::Done(RedisValueRef::Int(acked as i64));
     }
 
+    Wait::Block {
+        target,
+        numreplicas,
+        timeout_ms,
+    }
+}
+
+async fn handle_wait(
+    parts: &[RedisValueRef],
+    replication: &Arc<ReplicationState>,
+) -> RedisValueRef {
+    let (target, numreplicas, timeout_ms) = match start_wait(parts, replication) {
+        Wait::Done(response) => return response,
+        Wait::Block {
+            target,
+            numreplicas,
+            timeout_ms,
+        } => (target, numreplicas, timeout_ms),
+    };
+
+    let mut acked;
     replication.request_acks();
 
     // A timeout of 0 means block until numreplicas have acked.
