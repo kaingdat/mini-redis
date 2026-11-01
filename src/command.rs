@@ -20,6 +20,7 @@ enum Command {
     Echo,
     Set,
     Get,
+    Incr,
     ZAdd,
     ZRank,
     ZRange,
@@ -41,6 +42,7 @@ impl Command {
             b"ECHO" => Self::Echo,
             b"SET" => Self::Set,
             b"GET" => Self::Get,
+            b"INCR" => Self::Incr,
             b"ZADD" => Self::ZAdd,
             b"ZRANK" => Self::ZRank,
             b"ZRANGE" => Self::ZRange,
@@ -60,6 +62,7 @@ impl Command {
     fn write_handler(&self) -> Option<WriteHandler> {
         match self {
             Command::Set => Some(handle_set),
+            Command::Incr => Some(handle_incr),
             Command::ZAdd => Some(handle_zadd),
             Command::ZRem => Some(handle_zrem),
             _ => None,
@@ -189,7 +192,9 @@ pub async fn handle_command(
         Command::Wait => handle_wait(parts, replication).await,
         Command::Config => handle_config(parts, config),
         Command::Keys => handle_keys(parts, storage),
-        Command::Set | Command::ZAdd | Command::ZRem => unreachable!("dispatched as writes above"),
+        Command::Set | Command::Incr | Command::ZAdd | Command::ZRem => {
+            unreachable!("dispatched as writes above")
+        }
     }
 }
 
@@ -396,6 +401,47 @@ fn handle_set(parts: &[RedisValueRef], storage: &Arc<DashMap<Bytes, ValueEntry>>
 
     storage.insert(key, ValueEntry::new(RedisValue::String(value), expires_at));
     RedisValueRef::SimpleString(Bytes::from_static(b"OK"))
+}
+
+fn handle_incr(
+    parts: &[RedisValueRef],
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+) -> RedisValueRef {
+    arity!(parts, "incr", == 2);
+    let key = match require_bulk(parts, 1) {
+        Ok(b) => b.clone(),
+        Err(e) => return e,
+    };
+
+    storage.remove_if(&key, |_, entry| entry.is_expired());
+
+    let mut entry = storage
+        .entry(key)
+        .or_insert_with(|| ValueEntry::new(RedisValue::String(Bytes::from_static(b"0")), None));
+
+    let RedisValue::String(data) = &mut entry.data else {
+        return RedisValueRef::ErrorMsg(WRONGTYPE.to_vec());
+    };
+    let Some(current) = parse_strict_i64(data) else {
+        return RedisValueRef::ErrorMsg(b"ERR value is not an integer or out of range".to_vec());
+    };
+    let Some(next) = current.checked_add(1) else {
+        return RedisValueRef::ErrorMsg(b"ERR increment or decrement would overflow".to_vec());
+    };
+
+    *data = Bytes::from(next.to_string());
+    RedisValueRef::Int(next)
+}
+
+fn parse_strict_i64(bytes: &[u8]) -> Option<i64> {
+    let digits = bytes.strip_prefix(b"-").unwrap_or(bytes);
+    match digits {
+        [] => return None,
+        [b'0'] if digits.len() == bytes.len() => return Some(0),
+        [b'1'..=b'9', rest @ ..] if rest.iter().all(u8::is_ascii_digit) => {}
+        _ => return None,
+    }
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 fn handle_zadd(
