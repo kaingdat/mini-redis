@@ -33,6 +33,7 @@ enum Command {
     Wait,
     Config,
     Keys,
+    Type,
 }
 
 impl Command {
@@ -55,6 +56,7 @@ impl Command {
             b"WAIT" => Self::Wait,
             b"CONFIG" => Self::Config,
             b"KEYS" => Self::Keys,
+            b"TYPE" => Self::Type,
             _ => return None,
         })
     }
@@ -279,6 +281,7 @@ fn handle_read(
         Command::Psync => handle_psync(parts, config, replication),
         Command::Config => handle_config(parts, config),
         Command::Keys => handle_keys(parts, storage),
+        Command::Type => handle_type(parts, storage),
         Command::Wait => unreachable!("WAIT is dispatched by the caller"),
         Command::Set | Command::Incr | Command::ZAdd | Command::ZRem => {
             unreachable!("dispatched as writes by the caller")
@@ -452,6 +455,28 @@ fn handle_get(parts: &[RedisValueRef], storage: &Arc<DashMap<Bytes, ValueEntry>>
         },
         None => RedisValueRef::NullBulkString,
     }
+}
+
+fn handle_type(
+    parts: &[RedisValueRef],
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+) -> RedisValueRef {
+    arity!(parts, "type", == 2);
+    let key = match require_bulk(parts, 1) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+
+    storage.remove_if(key, |_, entry| entry.is_expired());
+
+    let name: &'static [u8] = match storage.get(key) {
+        Some(entry) => match &entry.data {
+            RedisValue::String(_) => b"string",
+            RedisValue::SortedSet(_) => b"zset",
+        },
+        None => b"none",
+    };
+    RedisValueRef::SimpleString(Bytes::from_static(name))
 }
 
 fn handle_set(parts: &[RedisValueRef], storage: &Arc<DashMap<Bytes, ValueEntry>>) -> RedisValueRef {
