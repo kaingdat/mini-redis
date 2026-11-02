@@ -15,6 +15,7 @@ use crate::{
     transaction::{ExecLock, Transaction},
     types::RedisValueRef,
     value::ValueEntry,
+    watch::Watches,
 };
 
 pub struct Session {
@@ -22,6 +23,7 @@ pub struct Session {
     pubsub: Arc<PubSub>,
     subscriber: Subscriber,
     waiters: Arc<StreamWaiters>,
+    watches: Arc<Watches>,
     blocked: Option<BlockedRead>,
 }
 
@@ -50,12 +52,13 @@ impl Response {
 }
 
 impl Session {
-    pub fn new(pubsub: Arc<PubSub>, waiters: Arc<StreamWaiters>) -> Self {
+    pub fn new(pubsub: Arc<PubSub>, waiters: Arc<StreamWaiters>, watches: Arc<Watches>) -> Self {
         Self {
-            transaction: Transaction::default(),
+            transaction: Transaction::new(Arc::clone(&watches)),
             subscriber: Subscriber::new(Arc::clone(&pubsub)),
             pubsub,
             waiters,
+            watches,
             blocked: None,
         }
     }
@@ -163,11 +166,11 @@ impl Session {
             return reply;
         }
         if is_wait_command(value) {
-            return handle_command(value, storage, config, replication, aof).await;
+            return handle_command(value, storage, config, replication, aof, &self.watches).await;
         }
         let reply = {
             let _shared = lock.read().await;
-            handle_command(value, storage, config, replication, aof).await
+            handle_command(value, storage, config, replication, aof, &self.watches).await
         };
         if let Some(key) = stream::added_key(value, &reply) {
             self.waiters.notify(key);
@@ -255,6 +258,7 @@ pub(crate) mod testing {
         transaction::ExecLock,
         types::RedisValueRef,
         value::ValueEntry,
+        watch::Watches,
     };
 
     pub(crate) struct Server {
@@ -265,6 +269,7 @@ pub(crate) mod testing {
         pub(crate) lock: Arc<ExecLock>,
         pub(crate) pubsub: Arc<PubSub>,
         pub(crate) waiters: Arc<StreamWaiters>,
+        pub(crate) watches: Arc<Watches>,
     }
 
     impl Server {
@@ -287,11 +292,16 @@ pub(crate) mod testing {
                 lock: Arc::new(ExecLock::default()),
                 pubsub: Arc::new(PubSub::new()),
                 waiters: Arc::new(StreamWaiters::new()),
+                watches: Arc::new(Watches::new()),
             }
         }
 
         pub(crate) fn session(&self) -> Session {
-            Session::new(Arc::clone(&self.pubsub), Arc::clone(&self.waiters))
+            Session::new(
+                Arc::clone(&self.pubsub),
+                Arc::clone(&self.waiters),
+                Arc::clone(&self.watches),
+            )
         }
 
         pub(crate) async fn send(&self, session: &mut Session, parts: &[&str]) -> RedisValueRef {

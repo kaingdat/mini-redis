@@ -26,6 +26,7 @@ use crate::{
     stream::concrete_form,
     types::{RedisValueRef, bulk_static},
     value::ValueEntry,
+    watch::Watches,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -441,6 +442,7 @@ async fn replay_file(
     let mut read = 0;
     let replication = Arc::new(ReplicationState::new());
     let no_aof = Arc::new(Aof::disabled());
+    let no_watches = Watches::new();
 
     let corrupt = |commands: usize, detail: String| {
         io::Error::new(
@@ -469,13 +471,22 @@ async fn replay_file(
                     (Some(b"EXEC"), Some(_)) => {
                         let (queued, _) = transaction.take().unwrap();
                         for value in &queued {
-                            handle_command(value, storage, config, &replication, &no_aof).await;
+                            handle_command(
+                                value,
+                                storage,
+                                config,
+                                &replication,
+                                &no_aof,
+                                &no_watches,
+                            )
+                            .await;
                         }
                         commands += queued.len();
                     }
                     (_, Some((queued, _))) => queued.push(value),
                     (_, None) => {
-                        handle_command(&value, storage, config, &replication, &no_aof).await;
+                        handle_command(&value, storage, config, &replication, &no_aof, &no_watches)
+                            .await;
                         commands += 1;
                     }
                 }
@@ -773,6 +784,32 @@ mod tests {
             crate::stream::handle_xrange(&parts, storage)
         };
         assert!(range(&restored) == range(&server.storage));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborted_exec_is_not_logged() {
+        use crate::session::testing::Server;
+
+        let (aof, dir) = open_temp("watch", "everysec");
+        let server = Server {
+            aof: Arc::new(aof),
+            ..Server::new()
+        };
+        let mut watcher = server.session();
+        let mut writer = server.session();
+        server.send(&mut watcher, &["WATCH", "k"]).await;
+        server.send(&mut writer, &["SET", "k", "b"]).await;
+
+        let (_, mut replica) = server.replication.register();
+        let log = dir.join("appendonlydir/appendonly.aof.1.incr.aof");
+        let logged = std::fs::read(&log).unwrap();
+        server.send(&mut watcher, &["MULTI"]).await;
+        server.send(&mut watcher, &["SET", "k", "a"]).await;
+        assert!(server.send(&mut watcher, &["EXEC"]).await == RedisValueRef::NullArray);
+
+        assert_eq!(std::fs::read(&log).unwrap(), logged);
+        assert!(replica.try_recv().is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

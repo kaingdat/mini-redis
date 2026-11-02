@@ -10,6 +10,7 @@ pub mod stream;
 pub mod transaction;
 pub mod types;
 pub mod value;
+pub mod watch;
 
 pub mod prelude {
     pub use crate::{
@@ -23,5 +24,6 @@ pub mod prelude {
         stream::StreamWaiters,
         transaction::ExecLock,
         value::ValueEntry,
+        watch::Watches,
     };
 }

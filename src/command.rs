@@ -11,6 +11,7 @@ use crate::{
     stream::{self, concrete_form},
     types::RedisValueRef,
     value::{RedisValue, SortedSetData, ValueEntry},
+    watch::Watches,
 };
 
 type WriteHandler = fn(&[RedisValueRef], &Arc<DashMap<Bytes, ValueEntry>>) -> RedisValueRef;
@@ -38,6 +39,7 @@ enum Command {
     XAdd,
     XRange,
     XRead,
+    Unwatch,
 }
 
 impl Command {
@@ -64,6 +66,7 @@ impl Command {
             b"XADD" => Self::XAdd,
             b"XRANGE" => Self::XRange,
             b"XREAD" => Self::XRead,
+            b"UNWATCH" => Self::Unwatch,
             _ => return None,
         })
     }
@@ -210,6 +213,7 @@ pub async fn handle_command(
     config: &Arc<ServerConfig>,
     replication: &Arc<ReplicationState>,
     aof: &Arc<Aof>,
+    watches: &Watches,
 ) -> RedisValueRef {
     let (command, parts) = match parse_command(value) {
         Ok(parsed) => parsed,
@@ -217,7 +221,14 @@ pub async fn handle_command(
     };
 
     if let Some(handler) = command.write_handler() {
-        let response = match aof.apply(parts, || handler(parts, storage)).await {
+        let execute = || {
+            let response = handler(parts, storage);
+            if !matches!(response, RedisValueRef::ErrorMsg(_)) {
+                watches.touch(parts);
+            }
+            response
+        };
+        let response = match aof.apply(parts, execute).await {
             Ok(response) => response,
             Err(rejected) => return rejected,
         };
@@ -236,6 +247,7 @@ pub(crate) fn execute_queued(
     storage: &Arc<DashMap<Bytes, ValueEntry>>,
     config: &Arc<ServerConfig>,
     replication: &Arc<ReplicationState>,
+    watches: &Watches,
 ) -> (RedisValueRef, bool) {
     let (command, parts) = match parse_command(value) {
         Ok(parsed) => parsed,
@@ -245,6 +257,9 @@ pub(crate) fn execute_queued(
     if let Some(handler) = command.write_handler() {
         let response = handler(parts, storage);
         let applied = !matches!(response, RedisValueRef::ErrorMsg(_));
+        if applied {
+            watches.touch(parts);
+        }
         return (response, applied);
     }
 
@@ -292,6 +307,10 @@ fn handle_read(
         Command::Type => handle_type(parts, storage),
         Command::XRange => stream::handle_xrange(parts, storage),
         Command::XRead => stream::handle_xread(parts, storage),
+        Command::Unwatch => {
+            arity!(parts, "unwatch", == 1);
+            RedisValueRef::SimpleString(Bytes::from_static(b"OK"))
+        }
         Command::Wait => unreachable!("WAIT is dispatched by the caller"),
         Command::Set | Command::Incr | Command::ZAdd | Command::ZRem | Command::XAdd => {
             unreachable!("dispatched as writes by the caller")
@@ -943,6 +962,7 @@ mod tests {
             &config,
             &replication,
             &Arc::new(Aof::disabled()),
+            &Watches::new(),
         )
         .await
     }
@@ -1106,7 +1126,15 @@ mod tests {
         let aof = Arc::new(Aof::disabled());
         let zadd = RedisValueRef::Array(vec![bulk(b"ZADD"), bulk(b"k"), bulk(b"1"), bulk(b"m")]);
 
-        let response = handle_command(&zadd, &storage, &config, &replication, &aof).await;
+        let response = handle_command(
+            &zadd,
+            &storage,
+            &config,
+            &replication,
+            &aof,
+            &Watches::new(),
+        )
+        .await;
         assert!(matches!(response, RedisValueRef::ErrorMsg(_)));
         assert_eq!(replication.master_offset(), 0);
     }

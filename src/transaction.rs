@@ -6,19 +6,21 @@ use tokio::sync::RwLock;
 
 use crate::{
     aof::Aof,
-    command::execute_queued,
+    command::{execute_queued, invalid_argument, wrong_arity},
     pubsub::PubSub,
     server::{ReplicationState, ServerConfig},
     stream::{StreamWaiters, added_key, concrete_form},
     types::RedisValueRef,
     value::ValueEntry,
+    watch::{WatchGuard, Watches},
 };
 
 pub type ExecLock = RwLock<()>;
 
-#[derive(Default)]
 pub(crate) struct Transaction {
     queued: Option<Vec<RedisValueRef>>,
+    watches: Arc<Watches>,
+    watching: Option<WatchGuard>,
 }
 
 #[derive(Clone, Copy)]
@@ -26,6 +28,8 @@ enum Control {
     Multi,
     Exec,
     Discard,
+    Watch,
+    Unwatch,
 }
 
 fn control(value: &RedisValueRef) -> Option<Control> {
@@ -39,7 +43,16 @@ fn control(value: &RedisValueRef) -> Option<Control> {
         b"MULTI" => Some(Control::Multi),
         b"EXEC" => Some(Control::Exec),
         b"DISCARD" => Some(Control::Discard),
+        b"WATCH" => Some(Control::Watch),
+        b"UNWATCH" => Some(Control::Unwatch),
         _ => None,
+    }
+}
+
+fn arity(value: &RedisValueRef) -> usize {
+    match value {
+        RedisValueRef::Array(parts) => parts.len(),
+        _ => 0,
     }
 }
 
@@ -52,12 +65,21 @@ fn error(message: &[u8]) -> RedisValueRef {
 }
 
 impl Transaction {
+    pub(crate) fn new(watches: Arc<Watches>) -> Self {
+        Self {
+            queued: None,
+            watches,
+            watching: None,
+        }
+    }
+
     pub(crate) fn is_active(&self) -> bool {
         self.queued.is_some()
     }
 
     pub(crate) fn discard(&mut self) {
         self.queued = None;
+        self.watching = None;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -83,6 +105,7 @@ impl Transaction {
                 let queued = self.queued.take().unwrap();
                 exec(
                     &queued,
+                    self.watching.take(),
                     storage,
                     config,
                     replication,
@@ -90,19 +113,52 @@ impl Transaction {
                     lock,
                     pubsub,
                     waiters,
+                    &self.watches,
                 )
                 .await
             }
             (Some(Control::Discard), None) => error(b"ERR DISCARD without MULTI"),
             (Some(Control::Discard), Some(_)) => {
-                self.queued = None;
+                self.discard();
+                ok()
+            }
+            (Some(Control::Watch), _) if arity(value) < 2 => wrong_arity("watch"),
+            (Some(Control::Watch), Some(_)) => {
+                error(b"ERR WATCH inside MULTI is not allowed")
+            }
+            (Some(Control::Watch), None) => {
+                let RedisValueRef::Array(parts) = value else {
+                    unreachable!("control() only matches arrays")
+                };
+                let Some(keys) = parts[1..]
+                    .iter()
+                    .map(|part| match part {
+                        RedisValueRef::BulkString(key) => Some(key),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return Some(invalid_argument());
+                };
+                let _shared = lock.read().await;
+                let watching = self
+                    .watching
+                    .get_or_insert_with(|| WatchGuard::new(&self.watches));
+                for key in keys {
+                    watching.watch(key, storage);
+                }
+                ok()
+            }
+            (Some(Control::Unwatch), None) if arity(value) != 1 => wrong_arity("unwatch"),
+            (Some(Control::Unwatch), None) => {
+                self.watching = None;
                 ok()
             }
             // TODO: validate the command name and arity here, and on failure
             // reply with the error and make EXEC answer "EXECABORT Transaction
             // discarded because of previous errors." as Redis does. For now
             // every command is queued and its error shows up in EXEC's reply.
-            (None, Some(queued)) => {
+            (None | Some(Control::Unwatch), Some(queued)) => {
                 queued.push(value.clone());
                 RedisValueRef::SimpleString(Bytes::from_static(b"QUEUED"))
             }
@@ -111,8 +167,10 @@ impl Transaction {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn exec(
     queued: &[RedisValueRef],
+    watching: Option<WatchGuard>,
     storage: &Arc<DashMap<Bytes, ValueEntry>>,
     config: &Arc<ServerConfig>,
     replication: &Arc<ReplicationState>,
@@ -120,8 +178,14 @@ async fn exec(
     lock: &ExecLock,
     pubsub: &PubSub,
     waiters: &StreamWaiters,
+    watches: &Watches,
 ) -> RedisValueRef {
     let _exclusive = lock.write().await;
+    let stale = watching.as_ref().is_some_and(WatchGuard::is_stale);
+    drop(watching);
+    if stale {
+        return RedisValueRef::NullArray;
+    }
     let mut propagated = Vec::new();
     let mut added = Vec::new();
     let result = aof
@@ -137,7 +201,7 @@ async fn exec(
                         }
                         None => {
                             let (reply, wrote) =
-                                execute_queued(value, storage, config, replication);
+                                execute_queued(value, storage, config, replication, watches);
                             (reply, wrote, wrote)
                         }
                     };

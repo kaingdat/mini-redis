@@ -28,6 +28,7 @@ async fn main() {
     let lock = Arc::new(ExecLock::default());
     let pubsub = Arc::new(PubSub::new());
     let waiters = Arc::new(StreamWaiters::new());
+    let watches = Arc::new(Watches::new());
 
     if matches!(config.role, Role::Replica { .. }) {
         let config = Arc::clone(&config);
@@ -37,6 +38,7 @@ async fn main() {
         let lock = Arc::clone(&lock);
         let pubsub = Arc::clone(&pubsub);
         let waiters = Arc::clone(&waiters);
+        let watches = Arc::clone(&watches);
         tokio::spawn(async move {
             if let Err(e) = replicate_from_master(
                 &config,
@@ -46,6 +48,7 @@ async fn main() {
                 &lock,
                 &pubsub,
                 &waiters,
+                &watches,
             )
             .await
             {
@@ -64,9 +67,10 @@ async fn main() {
                 let lock = Arc::clone(&lock);
                 let pubsub = Arc::clone(&pubsub);
                 let waiters = Arc::clone(&waiters);
+                let watches = Arc::clone(&watches);
                 tokio::spawn(async move {
                     let mut framed = Framed::new(stream, RespParser::default());
-                    let mut session = Session::new(pubsub, waiters);
+                    let mut session = Session::new(pubsub, waiters, watches);
                     let mut after = After::Continue;
                     while after == After::Continue {
                         tokio::select! {
