@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -9,6 +9,7 @@ use crate::{
     command::execute_queued,
     pubsub::PubSub,
     server::{ReplicationState, ServerConfig},
+    stream::{StreamWaiters, added_key, concrete_form},
     types::RedisValueRef,
     value::ValueEntry,
 };
@@ -59,6 +60,7 @@ impl Transaction {
         self.queued = None;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle(
         &mut self,
         value: &RedisValueRef,
@@ -68,6 +70,7 @@ impl Transaction {
         aof: &Arc<Aof>,
         lock: &ExecLock,
         pubsub: &PubSub,
+        waiters: &StreamWaiters,
     ) -> Option<RedisValueRef> {
         Some(match (control(value), &mut self.queued) {
             (Some(Control::Multi), Some(_)) => error(b"ERR MULTI calls can not be nested"),
@@ -78,7 +81,17 @@ impl Transaction {
             (Some(Control::Exec), None) => error(b"ERR EXEC without MULTI"),
             (Some(Control::Exec), Some(_)) => {
                 let queued = self.queued.take().unwrap();
-                exec(&queued, storage, config, replication, aof, lock, pubsub).await
+                exec(
+                    &queued,
+                    storage,
+                    config,
+                    replication,
+                    aof,
+                    lock,
+                    pubsub,
+                    waiters,
+                )
+                .await
             }
             (Some(Control::Discard), None) => error(b"ERR DISCARD without MULTI"),
             (Some(Control::Discard), Some(_)) => {
@@ -106,9 +119,11 @@ async fn exec(
     aof: &Arc<Aof>,
     lock: &ExecLock,
     pubsub: &PubSub,
+    waiters: &StreamWaiters,
 ) -> RedisValueRef {
     let _exclusive = lock.write().await;
     let mut propagated = Vec::new();
+    let mut added = Vec::new();
     let result = aof
         .apply_transaction(|| {
             let mut writes = Vec::new();
@@ -127,12 +142,16 @@ async fn exec(
                         }
                     };
                     if let RedisValueRef::Array(parts) = value {
+                        let form = concrete_form(parts, &reply);
                         if logged {
-                            writes.push(parts.as_slice());
+                            writes.push(form.clone());
                         }
                         if replicated {
-                            propagated.push(parts.as_slice());
+                            propagated.push(form);
                         }
+                    }
+                    if logged && let Some(key) = added_key(value, &reply) {
+                        added.push(key);
                     }
                     reply
                 })
@@ -142,7 +161,11 @@ async fn exec(
         .await;
     match result {
         Ok((reply, _)) => {
+            let propagated: Vec<&[RedisValueRef]> = propagated.iter().map(Cow::as_ref).collect();
             replication.propagate_transaction(&propagated);
+            for key in added {
+                waiters.notify(key);
+            }
             reply
         }
         Err(rejected) => rejected,

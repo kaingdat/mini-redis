@@ -13,6 +13,7 @@ use crate::{
     resp::{RespParser, encoded_len},
     server::{ReplicationState, Role, ServerConfig},
     session::Session,
+    stream::StreamWaiters,
     transaction::ExecLock,
     types::RedisValueRef,
     value::ValueEntry,
@@ -59,6 +60,7 @@ pub async fn replicate_from_master(
     aof: &Arc<Aof>,
     lock: &ExecLock,
     pubsub: &Arc<PubSub>,
+    waiters: &Arc<StreamWaiters>,
 ) -> anyhow::Result<()> {
     let Role::Replica { host, port } = &config.role else {
         return Ok(());
@@ -67,7 +69,7 @@ pub async fn replicate_from_master(
     let mut framed = handshake(host, *port, config.port).await?;
 
     let mut offset: u64 = 0;
-    let mut session = Session::new(Arc::clone(pubsub));
+    let mut session = Session::new(Arc::clone(pubsub), Arc::clone(waiters));
 
     while let Some(incoming) = framed.next().await {
         let Ok(value) = incoming else {

@@ -8,6 +8,7 @@ use crate::{
     aof::Aof,
     rdb::{to_deadline, unix_time_ms},
     server::{EMPTY_RDB, ReplicationState, ServerConfig},
+    stream::{self, concrete_form},
     types::RedisValueRef,
     value::{RedisValue, SortedSetData, ValueEntry},
 };
@@ -34,6 +35,9 @@ enum Command {
     Config,
     Keys,
     Type,
+    XAdd,
+    XRange,
+    XRead,
 }
 
 impl Command {
@@ -57,6 +61,9 @@ impl Command {
             b"CONFIG" => Self::Config,
             b"KEYS" => Self::Keys,
             b"TYPE" => Self::Type,
+            b"XADD" => Self::XAdd,
+            b"XRANGE" => Self::XRange,
+            b"XREAD" => Self::XRead,
             _ => return None,
         })
     }
@@ -67,6 +74,7 @@ impl Command {
             Command::Incr => Some(handle_incr),
             Command::ZAdd => Some(handle_zadd),
             Command::ZRem => Some(handle_zrem),
+            Command::XAdd => Some(stream::handle_xadd),
             _ => None,
         }
     }
@@ -128,7 +136,7 @@ pub fn parse_ack_offset(value: &RedisValueRef) -> Option<u64> {
     std::str::from_utf8(offset).ok()?.parse().ok()
 }
 
-const WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding wrong type value";
+pub(crate) const WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding wrong type value";
 
 pub(crate) fn invalid_argument() -> RedisValueRef {
     RedisValueRef::ErrorMsg(b"ERR invalid argument".to_vec())
@@ -213,7 +221,7 @@ pub async fn handle_command(
             Ok(response) => response,
             Err(rejected) => return rejected,
         };
-        replication.propagate(parts);
+        replication.propagate(&concrete_form(parts, &response));
         return response;
     }
 
@@ -282,8 +290,10 @@ fn handle_read(
         Command::Config => handle_config(parts, config),
         Command::Keys => handle_keys(parts, storage),
         Command::Type => handle_type(parts, storage),
+        Command::XRange => stream::handle_xrange(parts, storage),
+        Command::XRead => stream::handle_xread(parts, storage),
         Command::Wait => unreachable!("WAIT is dispatched by the caller"),
-        Command::Set | Command::Incr | Command::ZAdd | Command::ZRem => {
+        Command::Set | Command::Incr | Command::ZAdd | Command::ZRem | Command::XAdd => {
             unreachable!("dispatched as writes by the caller")
         }
     }
@@ -473,6 +483,7 @@ fn handle_type(
         Some(entry) => match &entry.data {
             RedisValue::String(_) => b"string",
             RedisValue::SortedSet(_) => b"zset",
+            RedisValue::Stream(_) => b"stream",
         },
         None => b"none",
     };
@@ -905,6 +916,171 @@ mod tests {
         ];
         assert!(
             matches!(handle_config(&parts, &config), RedisValueRef::Array(values) if values.len() == 4)
+        );
+    }
+
+    async fn run(storage: &Arc<DashMap<Bytes, ValueEntry>>, args: &[&str]) -> RedisValueRef {
+        let value = RedisValueRef::Array(
+            args.iter()
+                .map(|a| RedisValueRef::BulkString(Bytes::copy_from_slice(a.as_bytes())))
+                .collect(),
+        );
+        let config = Arc::new(ServerConfig {
+            port: 0,
+            role: crate::server::Role::Master,
+            replid: String::new(),
+            dir: String::new(),
+            dbfilename: String::new(),
+            appendonly: "no".into(),
+            appenddirname: String::new(),
+            appendfilename: String::new(),
+            appendfsync: "everysec".into(),
+        });
+        let replication = Arc::new(ReplicationState::new());
+        handle_command(
+            &value,
+            storage,
+            &config,
+            &replication,
+            &Arc::new(Aof::disabled()),
+        )
+        .await
+    }
+
+    fn reply_bulk(value: &str) -> RedisValueRef {
+        RedisValueRef::BulkString(Bytes::copy_from_slice(value.as_bytes()))
+    }
+
+    fn reply_err(value: &str) -> RedisValueRef {
+        RedisValueRef::ErrorMsg(value.as_bytes().to_vec())
+    }
+
+    #[tokio::test]
+    async fn xadd_stores_explicit_and_generated_ids() {
+        let storage = Arc::new(DashMap::new());
+        assert!(
+            run(&storage, &["XADD", "s", "1526919030473-0", "a", "1"]).await
+                == reply_bulk("1526919030473-0")
+        );
+        assert!(
+            run(&storage, &["XADD", "s", "1526919030474-*", "a", "1"]).await
+                == reply_bulk("1526919030474-0")
+        );
+        assert!(
+            run(&storage, &["XADD", "s", "1526919030474-*", "a", "1"]).await
+                == reply_bulk("1526919030474-1")
+        );
+        let RedisValueRef::BulkString(auto) = run(&storage, &["XADD", "s", "*", "a", "1"]).await
+        else {
+            panic!("expected an ID")
+        };
+        let ms: u64 = std::str::from_utf8(&auto)
+            .unwrap()
+            .split('-')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(ms >= unix_time_ms() - 1000);
+        assert!(run(&storage, &["XADD", "z", "0-*", "a", "1"]).await == reply_bulk("0-1"));
+        assert!(
+            run(&storage, &["TYPE", "s"]).await
+                == RedisValueRef::SimpleString(Bytes::from_static(b"stream"))
+        );
+    }
+
+    #[tokio::test]
+    async fn xadd_rejects_bad_ids_and_arguments() {
+        let storage = Arc::new(DashMap::new());
+        let not_greater =
+            "ERR The ID specified in XADD is equal or smaller than the target stream top item";
+        assert!(
+            run(&storage, &["XADD", "s", "0-0", "a", "1"]).await
+                == reply_err("ERR The ID specified in XADD must be greater than 0-0")
+        );
+        assert!(
+            run(&storage, &["XADD", "s", "x-1", "a", "1"]).await
+                == reply_err("ERR Invalid stream ID specified as stream command argument")
+        );
+        assert!(
+            run(&storage, &["XADD", "s", "1-1", "a"]).await
+                == reply_err("ERR wrong number of arguments for 'xadd' command")
+        );
+        assert!(
+            run(&storage, &["XADD", "s", "1-1"]).await
+                == reply_err("ERR wrong number of arguments for 'xadd' command")
+        );
+        assert!(
+            storage.is_empty(),
+            "a failed XADD must not create the stream"
+        );
+
+        run(&storage, &["XADD", "s", "5-5", "a", "1"]).await;
+        assert!(run(&storage, &["XADD", "s", "5-5", "a", "1"]).await == reply_err(not_greater));
+        assert!(run(&storage, &["XADD", "s", "4-9", "a", "1"]).await == reply_err(not_greater));
+        assert!(run(&storage, &["XADD", "s", "4-*", "a", "1"]).await == reply_err(not_greater));
+    }
+
+    #[tokio::test]
+    async fn xadd_and_stream_reads_check_types() {
+        let storage = Arc::new(DashMap::new());
+        let wrongtype = reply_err("WRONGTYPE Operation against a key holding wrong type value");
+        run(&storage, &["SET", "str", "v"]).await;
+        assert!(run(&storage, &["XADD", "str", "*", "a", "1"]).await == wrongtype);
+        assert!(run(&storage, &["XRANGE", "str", "-", "+"]).await == wrongtype);
+        assert!(run(&storage, &["XREAD", "STREAMS", "str", "0"]).await == wrongtype);
+        run(&storage, &["XADD", "s", "1-1", "a", "1"]).await;
+        assert!(run(&storage, &["GET", "s"]).await == wrongtype);
+    }
+
+    #[tokio::test]
+    async fn xrange_is_inclusive_and_accepts_short_ids() {
+        let storage = Arc::new(DashMap::new());
+        for id in ["1-0", "1-1", "2-0", "3-0"] {
+            run(&storage, &["XADD", "s", id, "f", id]).await;
+        }
+        let ids = |reply: RedisValueRef| -> Vec<String> {
+            let RedisValueRef::Array(entries) = reply else {
+                panic!("expected array")
+            };
+            entries
+                .into_iter()
+                .map(|entry| match entry {
+                    RedisValueRef::Array(pair) => match &pair[0] {
+                        RedisValueRef::BulkString(id) => String::from_utf8(id.to_vec()).unwrap(),
+                        _ => panic!("expected id"),
+                    },
+                    _ => panic!("expected entry"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            ids(run(&storage, &["XRANGE", "s", "1-1", "2-0"]).await),
+            ["1-1", "2-0"]
+        );
+        assert_eq!(
+            ids(run(&storage, &["XRANGE", "s", "1", "2"]).await),
+            ["1-0", "1-1", "2-0"]
+        );
+        assert_eq!(
+            ids(run(&storage, &["XRANGE", "s", "-", "+"]).await).len(),
+            4
+        );
+        assert_eq!(
+            ids(run(&storage, &["XRANGE", "s", "-", "1"]).await),
+            ["1-0", "1-1"]
+        );
+        assert_eq!(
+            ids(run(&storage, &["XRANGE", "s", "3", "+"]).await),
+            ["3-0"]
+        );
+        assert!(ids(run(&storage, &["XRANGE", "missing", "-", "+"]).await).is_empty());
+        assert!(
+            run(&storage, &["XRANGE", "s", "1-0", "1-0"]).await
+                == RedisValueRef::Array(vec![RedisValueRef::Array(vec![
+                    reply_bulk("1-0"),
+                    RedisValueRef::Array(vec![reply_bulk("f"), reply_bulk("1-0")]),
+                ])])
         );
     }
 

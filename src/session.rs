@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use tokio::time::Instant;
 
 use crate::{
     aof::Aof,
@@ -10,6 +11,7 @@ use crate::{
     },
     pubsub::{PubSub, Subscriber},
     server::{ReplicationState, ServerConfig},
+    stream::{self, BlockedRead, StreamWaiters, XRead},
     transaction::{ExecLock, Transaction},
     types::RedisValueRef,
     value::ValueEntry,
@@ -19,6 +21,8 @@ pub struct Session {
     transaction: Transaction,
     pubsub: Arc<PubSub>,
     subscriber: Subscriber,
+    waiters: Arc<StreamWaiters>,
+    blocked: Option<BlockedRead>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -26,6 +30,9 @@ pub enum After {
     Continue,
     Close,
     StreamToReplica,
+    /// A blocking `XREAD` found nothing. The connection must call
+    /// [`Session::wait_blocked`] and send its reply before reading on.
+    Block,
 }
 
 pub struct Response {
@@ -43,17 +50,20 @@ impl Response {
 }
 
 impl Session {
-    pub fn new(pubsub: Arc<PubSub>) -> Self {
+    pub fn new(pubsub: Arc<PubSub>, waiters: Arc<StreamWaiters>) -> Self {
         Self {
             transaction: Transaction::default(),
             subscriber: Subscriber::new(Arc::clone(&pubsub)),
             pubsub,
+            waiters,
+            blocked: None,
         }
     }
 
     fn reset(&mut self) {
         self.transaction.discard();
         self.subscriber.reset();
+        self.blocked = None;
     }
 
     pub async fn next_message(&mut self) -> Option<Bytes> {
@@ -73,6 +83,7 @@ impl Session {
         aof: &Arc<Aof>,
         lock: &ExecLock,
     ) -> Response {
+        self.blocked = None;
         match connection_command(value) {
             Some(ConnectionCommand::Quit) => {
                 return Response {
@@ -104,6 +115,12 @@ impl Session {
                     after: After::StreamToReplica,
                 };
             }
+            if let Some(read) = stream::parse_blocking_xread(value) {
+                return match read {
+                    Ok(read) => self.start_blocking_read(read, storage, lock).await,
+                    Err(e) => Response::one(e),
+                };
+            }
         }
 
         Response::one(
@@ -123,7 +140,16 @@ impl Session {
     ) -> RedisValueRef {
         if let Some(reply) = self
             .transaction
-            .handle(value, storage, config, replication, aof, lock, &self.pubsub)
+            .handle(
+                value,
+                storage,
+                config,
+                replication,
+                aof,
+                lock,
+                &self.pubsub,
+                &self.waiters,
+            )
             .await
         {
             return reply;
@@ -139,8 +165,77 @@ impl Session {
         if is_wait_command(value) {
             return handle_command(value, storage, config, replication, aof).await;
         }
-        let _shared = lock.read().await;
-        handle_command(value, storage, config, replication, aof).await
+        let reply = {
+            let _shared = lock.read().await;
+            handle_command(value, storage, config, replication, aof).await
+        };
+        if let Some(key) = stream::added_key(value, &reply) {
+            self.waiters.notify(key);
+        }
+        reply
+    }
+
+    async fn start_blocking_read(
+        &mut self,
+        read: XRead,
+        storage: &Arc<DashMap<Bytes, ValueEntry>>,
+        lock: &ExecLock,
+    ) -> Response {
+        // Registered before the first check, so an XADD that lands after the
+        // check but before the wait still leaves a wake-up behind.
+        let guard = self.waiters.register(&read.keys);
+        let ids = {
+            let _shared = lock.read().await;
+            let ids = match stream::resolve_ids(storage, &read.keys, &read.ids) {
+                Ok(ids) => ids,
+                Err(e) => return Response::one(e),
+            };
+            match stream::read_after(storage, &read.keys, &ids) {
+                Ok(None) => ids,
+                Ok(Some(reply)) | Err(reply) => return Response::one(reply),
+            }
+        };
+        let timeout_ms = read.block_ms.unwrap_or(0);
+        self.blocked = Some(BlockedRead {
+            keys: read.keys,
+            ids,
+            deadline: (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms)),
+            guard,
+        });
+        Response {
+            replies: Vec::new(),
+            after: After::Block,
+        }
+    }
+
+    /// Waits for the read that returned [`After::Block`] and gives its reply.
+    /// Holds no lock while waiting, and dropping the future cancels the read.
+    pub async fn wait_blocked(
+        &mut self,
+        storage: &Arc<DashMap<Bytes, ValueEntry>>,
+        lock: &ExecLock,
+    ) -> RedisValueRef {
+        let Some(blocked) = self.blocked.take() else {
+            return RedisValueRef::NullArray;
+        };
+        loop {
+            match blocked.deadline {
+                None => blocked.guard.notified().await,
+                Some(deadline) => {
+                    if tokio::time::timeout_at(deadline, blocked.guard.notified())
+                        .await
+                        .is_err()
+                    {
+                        return RedisValueRef::NullArray;
+                    }
+                }
+            }
+            let _shared = lock.read().await;
+            match stream::read_after(storage, &blocked.keys, &blocked.ids) {
+                Ok(None) => {}
+                Ok(Some(reply)) | Err(reply) => return reply,
+            }
+        }
     }
 }
 
@@ -156,6 +251,7 @@ pub(crate) mod testing {
         aof::Aof,
         pubsub::PubSub,
         server::{ReplicationState, Role, ServerConfig},
+        stream::StreamWaiters,
         transaction::ExecLock,
         types::RedisValueRef,
         value::ValueEntry,
@@ -168,6 +264,7 @@ pub(crate) mod testing {
         pub(crate) aof: Arc<Aof>,
         pub(crate) lock: Arc<ExecLock>,
         pub(crate) pubsub: Arc<PubSub>,
+        pub(crate) waiters: Arc<StreamWaiters>,
     }
 
     impl Server {
@@ -189,11 +286,12 @@ pub(crate) mod testing {
                 aof: Arc::new(Aof::disabled()),
                 lock: Arc::new(ExecLock::default()),
                 pubsub: Arc::new(PubSub::new()),
+                waiters: Arc::new(StreamWaiters::new()),
             }
         }
 
         pub(crate) fn session(&self) -> Session {
-            Session::new(Arc::clone(&self.pubsub))
+            Session::new(Arc::clone(&self.pubsub), Arc::clone(&self.waiters))
         }
 
         pub(crate) async fn send(&self, session: &mut Session, parts: &[&str]) -> RedisValueRef {
@@ -241,10 +339,240 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use bytes::Bytes;
 
-    use super::{After, testing::*};
+    use super::{After, Session, testing::*};
     use crate::types::RedisValueRef;
+
+    fn command(parts: &[&str]) -> RedisValueRef {
+        RedisValueRef::Array(
+            parts
+                .iter()
+                .map(|part| RedisValueRef::BulkString(Bytes::copy_from_slice(part.as_bytes())))
+                .collect(),
+        )
+    }
+
+    fn entry(id: &'static str, field: &'static str, value: &'static str) -> RedisValueRef {
+        RedisValueRef::Array(vec![
+            bulk(id),
+            RedisValueRef::Array(vec![bulk(field), bulk(value)]),
+        ])
+    }
+
+    fn stream(key: &'static str, entries: Vec<RedisValueRef>) -> RedisValueRef {
+        RedisValueRef::Array(vec![bulk(key), RedisValueRef::Array(entries)])
+    }
+
+    async fn block(server: &Server, session: &mut Session, parts: &[&str]) {
+        let response = server.send_raw(session, &command(parts)).await;
+        assert!(response.replies.is_empty());
+        assert_eq!(response.after, After::Block);
+    }
+
+    #[tokio::test]
+    async fn xread_returns_streams_in_order_and_only_newer_entries() {
+        let server = Server::new();
+        let mut session = server.session();
+        server
+            .send(&mut session, &["XADD", "a", "1-1", "f", "a1"])
+            .await;
+        server
+            .send(&mut session, &["XADD", "a", "1-2", "f", "a2"])
+            .await;
+        server
+            .send(&mut session, &["XADD", "b", "2-1", "f", "b1"])
+            .await;
+
+        let reply = server
+            .send(
+                &mut session,
+                &["XREAD", "STREAMS", "b", "a", "missing", "0", "1-1", "0"],
+            )
+            .await;
+        assert!(
+            reply
+                == RedisValueRef::Array(vec![
+                    stream("b", vec![entry("2-1", "f", "b1")]),
+                    stream("a", vec![entry("1-2", "f", "a2")]),
+                ])
+        );
+        assert!(
+            server
+                .send(&mut session, &["XREAD", "STREAMS", "a", "1-2"])
+                .await
+                == RedisValueRef::NullArray
+        );
+        assert!(
+            server
+                .send(&mut session, &["XREAD", "STREAMS", "a", "$"])
+                .await
+                == RedisValueRef::NullArray
+        );
+        assert!(
+            server
+                .send(
+                    &mut session,
+                    &["XREAD", "BLOCK", "1000", "STREAMS", "a", "0"]
+                )
+                .await
+                == RedisValueRef::Array(vec![stream(
+                    "a",
+                    vec![entry("1-1", "f", "a1"), entry("1-2", "f", "a2")]
+                )]),
+            "a blocking read with data replies at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn xread_block_wakes_on_another_sessions_xadd() {
+        let server = Server::new();
+        let mut reader = server.session();
+        let mut writer = server.session();
+        server
+            .send(&mut writer, &["XADD", "s", "1-1", "old", "x"])
+            .await;
+        block(
+            &server,
+            &mut reader,
+            &["XREAD", "BLOCK", "0", "STREAMS", "other", "s", "$", "$"],
+        )
+        .await;
+
+        let write = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // A wake-up with nothing new must go back to waiting.
+            server.waiters.notify(&Bytes::from_static(b"s"));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            server
+                .send(&mut writer, &["XADD", "s", "2-0", "temp", "37"])
+                .await
+        };
+        let (reply, _) = tokio::join!(reader.wait_blocked(&server.storage, &server.lock), write);
+        assert!(reply == RedisValueRef::Array(vec![stream("s", vec![entry("2-0", "temp", "37")])]));
+        assert!(server.waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn xread_block_times_out_with_a_null_array() {
+        let server = Server::new();
+        let mut reader = server.session();
+        block(
+            &server,
+            &mut reader,
+            &["XREAD", "BLOCK", "30", "STREAMS", "s", "$"],
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let reply = reader.wait_blocked(&server.storage, &server.lock).await;
+        assert!(reply == RedisValueRef::NullArray);
+        assert!(started.elapsed() >= Duration::from_millis(25));
+        assert!(server.waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn xread_block_wakes_on_xadd_inside_exec() {
+        let server = Server::new();
+        let mut reader = server.session();
+        let mut writer = server.session();
+        block(
+            &server,
+            &mut reader,
+            &["XREAD", "BLOCK", "0", "STREAMS", "s", "0"],
+        )
+        .await;
+
+        let write = async {
+            server.send(&mut writer, &["MULTI"]).await;
+            server
+                .send(&mut writer, &["XADD", "s", "1-1", "f", "v"])
+                .await;
+            server.send(&mut writer, &["EXEC"]).await
+        };
+        let (reply, exec) = tokio::join!(reader.wait_blocked(&server.storage, &server.lock), write);
+        assert!(exec == RedisValueRef::Array(vec![bulk("1-1")]));
+        assert!(reply == RedisValueRef::Array(vec![stream("s", vec![entry("1-1", "f", "v")])]));
+    }
+
+    #[tokio::test]
+    async fn xread_block_inside_multi_does_not_block() {
+        let server = Server::new();
+        let mut session = server.session();
+        server.send(&mut session, &["MULTI"]).await;
+        assert!(
+            server
+                .send(&mut session, &["XREAD", "BLOCK", "0", "STREAMS", "s", "$"])
+                .await
+                == simple("QUEUED")
+        );
+        assert!(
+            server.send(&mut session, &["EXEC"]).await
+                == RedisValueRef::Array(vec![RedisValueRef::NullArray])
+        );
+    }
+
+    #[tokio::test]
+    async fn xread_blocked_reader_holds_no_lock() {
+        let server = Server::new();
+        let mut reader = server.session();
+        let mut writer = server.session();
+        block(
+            &server,
+            &mut reader,
+            &["XREAD", "BLOCK", "0", "STREAMS", "s", "$"],
+        )
+        .await;
+
+        let wait = reader.wait_blocked(&server.storage, &server.lock);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut wait)
+                .await
+                .is_err()
+        );
+        server.send(&mut writer, &["MULTI"]).await;
+        server.send(&mut writer, &["SET", "k", "v"]).await;
+        let exec = tokio::time::timeout(
+            Duration::from_millis(100),
+            server.send(&mut writer, &["EXEC"]),
+        )
+        .await;
+        assert!(exec.ok() == Some(RedisValueRef::Array(vec![simple("OK")])));
+    }
+
+    #[tokio::test]
+    async fn xread_dropping_a_blocked_read_unregisters_it() {
+        let server = Server::new();
+        let mut reader = server.session();
+        block(
+            &server,
+            &mut reader,
+            &["XREAD", "BLOCK", "0", "STREAMS", "a", "b", "$", "$"],
+        )
+        .await;
+        assert!(!server.waiters.is_empty());
+        {
+            let wait = reader.wait_blocked(&server.storage, &server.lock);
+            tokio::pin!(wait);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut wait)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(server.waiters.is_empty());
+
+        block(
+            &server,
+            &mut reader,
+            &["XREAD", "BLOCK", "0", "STREAMS", "a", "$"],
+        )
+        .await;
+        drop(reader);
+        assert!(server.waiters.is_empty());
+    }
 
     #[tokio::test]
     async fn publish_is_replicated_but_not_failed_ones() {

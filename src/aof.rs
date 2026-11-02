@@ -23,6 +23,7 @@ use crate::{
     rdb::{load_into, unix_time_ms},
     resp::{RespParser, encode_command},
     server::{ReplicationState, ServerConfig},
+    stream::concrete_form,
     types::{RedisValueRef, bulk_static},
     value::ValueEntry,
 };
@@ -227,7 +228,7 @@ impl Aof {
                 let encoded = if !encode || is_error(&response) {
                     Bytes::new()
                 } else {
-                    encode_command(&logged_form(parts))
+                    encode_command(&logged_form(&concrete_form(parts, &response)))
                 };
                 (response, encoded)
             })
@@ -240,8 +241,8 @@ impl Aof {
 
     pub async fn apply_transaction<'q>(
         &self,
-        execute: impl FnOnce() -> (Vec<RedisValueRef>, Vec<&'q [RedisValueRef]>),
-    ) -> Result<(RedisValueRef, Vec<&'q [RedisValueRef]>), RedisValueRef> {
+        execute: impl FnOnce() -> (Vec<RedisValueRef>, Vec<Cow<'q, [RedisValueRef]>>),
+    ) -> Result<(RedisValueRef, Vec<Cow<'q, [RedisValueRef]>>), RedisValueRef> {
         let ((replies, writes), log_error) = self
             .execute_logged(|encode| {
                 let (replies, writes) = execute();
@@ -347,7 +348,7 @@ fn misconf(e: &io::Error) -> RedisValueRef {
     RedisValueRef::ErrorMsg(format!("MISCONF Errors writing to the AOF file: {e}").into_bytes())
 }
 
-fn encode_transaction(writes: &[&[RedisValueRef]]) -> Bytes {
+fn encode_transaction(writes: &[Cow<'_, [RedisValueRef]>]) -> Bytes {
     if writes.is_empty() {
         return Bytes::new();
     }
@@ -706,6 +707,72 @@ mod tests {
         for key in ["a", "b", "c"] {
             assert!(storage.contains_key(key.as_bytes()));
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn xadd_is_logged_with_its_concrete_id() {
+        use crate::session::testing::{Server, bulk};
+
+        let (aof, dir) = open_temp("xadd", "everysec");
+        let server = Server {
+            aof: Arc::new(aof),
+            ..Server::new()
+        };
+        let (_, mut replica) = server.replication.register();
+        let mut session = server.session();
+
+        let RedisValueRef::BulkString(first) = server
+            .send(&mut session, &["XADD", "s", "*", "a", "1"])
+            .await
+        else {
+            panic!("expected an ID")
+        };
+        server.send(&mut session, &["MULTI"]).await;
+        server
+            .send(&mut session, &["XADD", "s", "*", "b", "2"])
+            .await;
+        let RedisValueRef::Array(replies) = server.send(&mut session, &["EXEC"]).await else {
+            panic!("expected EXEC replies")
+        };
+        let RedisValueRef::BulkString(second) = &replies[0] else {
+            panic!("expected an ID")
+        };
+
+        let xadd = |id: &Bytes, field: &'static [u8], value: &'static [u8]| {
+            encode_command(&[
+                bulk("XADD"),
+                bulk("s"),
+                RedisValueRef::BulkString(id.clone()),
+                RedisValueRef::BulkString(Bytes::from_static(field)),
+                RedisValueRef::BulkString(Bytes::from_static(value)),
+            ])
+        };
+        let mut expected = xadd(&first, b"a", b"1").to_vec();
+        expected.extend_from_slice(&encode_command(&[bulk("MULTI")]));
+        expected.extend_from_slice(&xadd(second, b"b", b"2"));
+        expected.extend_from_slice(&encode_command(&[bulk("EXEC")]));
+
+        let logged = std::fs::read(dir.join("appendonlydir/appendonly.aof.1.incr.aof")).unwrap();
+        assert_eq!(logged, expected);
+        let mut replicated = replica.try_recv().unwrap().to_vec();
+        replicated.extend_from_slice(&replica.try_recv().unwrap());
+        assert_eq!(replicated, expected);
+
+        let restored = Arc::new(DashMap::new());
+        assert_eq!(
+            server
+                .aof
+                .replay(&restored, &replay_config())
+                .await
+                .unwrap(),
+            2
+        );
+        let range = |storage| {
+            let parts = command(&[b"XRANGE", b"s", b"-", b"+"]);
+            crate::stream::handle_xrange(&parts, storage)
+        };
+        assert!(range(&restored) == range(&server.storage));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

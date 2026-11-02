@@ -3,10 +3,13 @@ use std::collections::{BTreeSet, HashMap};
 use bytes::Bytes;
 use tokio::time::Instant;
 
+use crate::stream::StreamData;
+
 #[derive(Clone)]
 pub enum RedisValue {
     String(Bytes),
     SortedSet(SortedSetData),
+    Stream(StreamData),
 }
 
 pub struct ValueEntry {

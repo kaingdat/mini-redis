@@ -27,6 +27,7 @@ async fn main() {
     let replication = Arc::new(ReplicationState::new());
     let lock = Arc::new(ExecLock::default());
     let pubsub = Arc::new(PubSub::new());
+    let waiters = Arc::new(StreamWaiters::new());
 
     if matches!(config.role, Role::Replica { .. }) {
         let config = Arc::clone(&config);
@@ -35,9 +36,18 @@ async fn main() {
         let aof = Arc::clone(&aof);
         let lock = Arc::clone(&lock);
         let pubsub = Arc::clone(&pubsub);
+        let waiters = Arc::clone(&waiters);
         tokio::spawn(async move {
-            if let Err(e) =
-                replicate_from_master(&config, &storage, &replication, &aof, &lock, &pubsub).await
+            if let Err(e) = replicate_from_master(
+                &config,
+                &storage,
+                &replication,
+                &aof,
+                &lock,
+                &pubsub,
+                &waiters,
+            )
+            .await
             {
                 eprintln!("failed to replicate from master: {}", e);
             }
@@ -53,9 +63,10 @@ async fn main() {
                 let aof = Arc::clone(&aof);
                 let lock = Arc::clone(&lock);
                 let pubsub = Arc::clone(&pubsub);
+                let waiters = Arc::clone(&waiters);
                 tokio::spawn(async move {
                     let mut framed = Framed::new(stream, RespParser::default());
-                    let mut session = Session::new(pubsub);
+                    let mut session = Session::new(pubsub, waiters);
                     let mut after = After::Continue;
                     while after == After::Continue {
                         tokio::select! {
@@ -68,6 +79,18 @@ async fn main() {
                                     break;
                                 }
                                 after = response.after;
+                                if after == After::Block {
+                                    let Some(reply) =
+                                        wait_blocked(&mut framed, &mut session, &storage, &lock)
+                                            .await
+                                    else {
+                                        break;
+                                    };
+                                    if send_all(&mut framed, vec![reply]).await.is_err() {
+                                        break;
+                                    }
+                                    after = After::Continue;
+                                }
                             }
                             message = session.next_message() => {
                                 let Some(message) = message else { break };
@@ -84,6 +107,34 @@ async fn main() {
                 });
             }
             Err(e) => eprintln!("error: {}", e),
+        }
+    }
+}
+
+/// Runs a blocked read until it replies or the client disconnects. Bytes
+/// that arrive meanwhile are buffered undecoded, so pipelined commands run
+/// afterwards in order. Returns `None` once the connection is gone.
+async fn wait_blocked(
+    framed: &mut Framed<TcpStream, RespParser>,
+    session: &mut Session,
+    storage: &Arc<DashMap<Bytes, ValueEntry>>,
+    lock: &ExecLock,
+) -> Option<RedisValueRef> {
+    let wait = session.wait_blocked(storage, lock);
+    tokio::pin!(wait);
+    let mut buf = [0u8; 4096];
+    loop {
+        tokio::select! {
+            reply = &mut wait => return Some(reply),
+            ready = framed.get_ref().readable() => {
+                ready.ok()?;
+                match framed.get_ref().try_read(&mut buf) {
+                    Ok(0) => return None,
+                    Ok(n) => framed.read_buffer_mut().extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => return None,
+                }
+            }
         }
     }
 }

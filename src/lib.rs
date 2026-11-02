@@ -6,6 +6,7 @@ pub mod replication;
 pub mod resp;
 pub mod server;
 pub mod session;
+pub mod stream;
 pub mod transaction;
 pub mod types;
 pub mod value;
@@ -19,6 +20,7 @@ pub mod prelude {
         resp::RespParser,
         server::{ReplicationState, Role, ServerConfig},
         session::{After, Session},
+        stream::StreamWaiters,
         transaction::ExecLock,
         value::ValueEntry,
     };
