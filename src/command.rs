@@ -6,6 +6,7 @@ use tokio::time::Instant;
 
 use crate::{
     aof::Aof,
+    geo,
     rdb::{to_deadline, unix_time_ms},
     server::{EMPTY_RDB, ReplicationState, ServerConfig},
     stream::{self, concrete_form},
@@ -39,6 +40,10 @@ enum Command {
     XAdd,
     XRange,
     XRead,
+    GeoAdd,
+    GeoPos,
+    GeoDist,
+    GeoSearch,
     Unwatch,
 }
 
@@ -66,6 +71,10 @@ impl Command {
             b"XADD" => Self::XAdd,
             b"XRANGE" => Self::XRange,
             b"XREAD" => Self::XRead,
+            b"GEOADD" => Self::GeoAdd,
+            b"GEOPOS" => Self::GeoPos,
+            b"GEODIST" => Self::GeoDist,
+            b"GEOSEARCH" => Self::GeoSearch,
             b"UNWATCH" => Self::Unwatch,
             _ => return None,
         })
@@ -78,6 +87,7 @@ impl Command {
             Command::ZAdd => Some(handle_zadd),
             Command::ZRem => Some(handle_zrem),
             Command::XAdd => Some(stream::handle_xadd),
+            Command::GeoAdd => Some(geo::handle_geoadd),
             _ => None,
         }
     }
@@ -307,12 +317,20 @@ fn handle_read(
         Command::Type => handle_type(parts, storage),
         Command::XRange => stream::handle_xrange(parts, storage),
         Command::XRead => stream::handle_xread(parts, storage),
+        Command::GeoPos => geo::handle_geopos(parts, storage),
+        Command::GeoDist => geo::handle_geodist(parts, storage),
+        Command::GeoSearch => geo::handle_geosearch(parts, storage),
         Command::Unwatch => {
             arity!(parts, "unwatch", == 1);
             RedisValueRef::SimpleString(Bytes::from_static(b"OK"))
         }
         Command::Wait => unreachable!("WAIT is dispatched by the caller"),
-        Command::Set | Command::Incr | Command::ZAdd | Command::ZRem | Command::XAdd => {
+        Command::Set
+        | Command::Incr
+        | Command::ZAdd
+        | Command::ZRem
+        | Command::XAdd
+        | Command::GeoAdd => {
             unreachable!("dispatched as writes by the caller")
         }
     }
@@ -726,7 +744,7 @@ fn handle_zcard(
     }
 }
 
-fn parse_score(s: &str) -> Result<f64, RedisValueRef> {
+pub(crate) fn parse_score(s: &str) -> Result<f64, RedisValueRef> {
     match s {
         "+inf" | "inf" => return Ok(f64::INFINITY),
         "-inf" => return Ok(f64::NEG_INFINITY),
@@ -1137,5 +1155,322 @@ mod tests {
         .await;
         assert!(matches!(response, RedisValueRef::ErrorMsg(_)));
         assert_eq!(replication.master_offset(), 0);
+    }
+
+    #[tokio::test]
+    async fn geo_commands_follow_the_redis_examples() {
+        let storage = Arc::new(DashMap::new());
+        let add = [
+            "GEOADD",
+            "Sicily",
+            "13.361389",
+            "38.115556",
+            "Palermo",
+            "15.087269",
+            "37.502669",
+            "Catania",
+        ];
+        assert!(run(&storage, &add).await == RedisValueRef::Int(2));
+        assert!(run(&storage, &add).await == RedisValueRef::Int(0));
+        assert!(
+            run(&storage, &["GEODIST", "Sicily", "Palermo", "Catania"]).await
+                == reply_bulk("166274.1516")
+        );
+        assert!(
+            run(&storage, &["GEODIST", "Sicily", "Palermo", "Catania", "KM"]).await
+                == reply_bulk("166.2742")
+        );
+        assert!(
+            run(&storage, &["GEOPOS", "Sicily", "Palermo", "nope"]).await
+                == RedisValueRef::Array(vec![
+                    RedisValueRef::Array(vec![
+                        reply_bulk("13.361389338970184"),
+                        reply_bulk("38.1155563954963"),
+                    ]),
+                    RedisValueRef::NullArray,
+                ])
+        );
+        assert!(
+            run(&storage, &["ZSCORE", "Sicily", "Palermo"]).await == reply_bulk("3479099956230698")
+        );
+        assert!(
+            run(&storage, &["TYPE", "Sicily"]).await
+                == RedisValueRef::SimpleString(Bytes::from_static(b"zset"))
+        );
+
+        let search = |order: &'static str| {
+            let storage = storage.clone();
+            async move {
+                let mut args = vec![
+                    "GEOSEARCH",
+                    "Sicily",
+                    "FROMLONLAT",
+                    "15",
+                    "37",
+                    "BYRADIUS",
+                    "200",
+                    "km",
+                ];
+                if !order.is_empty() {
+                    args.push(order);
+                }
+                run(&storage, &args).await
+            }
+        };
+        let names = |v: &[&str]| RedisValueRef::Array(v.iter().map(|m| reply_bulk(m)).collect());
+        assert!(search("").await == names(&["Palermo", "Catania"]));
+        assert!(search("ASC").await == names(&["Catania", "Palermo"]));
+        assert!(search("desc").await == names(&["Palermo", "Catania"]));
+        assert!(
+            run(
+                &storage,
+                &[
+                    "GEOSEARCH",
+                    "Sicily",
+                    "FROMLONLAT",
+                    "15",
+                    "37",
+                    "BYRADIUS",
+                    "100",
+                    "km"
+                ]
+            )
+            .await
+                == names(&["Catania"])
+        );
+        assert!(
+            run(
+                &storage,
+                &[
+                    "GEOSEARCH",
+                    "Sicily",
+                    "FROMLONLAT",
+                    "15",
+                    "37",
+                    "BYRADIUS",
+                    "200",
+                    "km",
+                    "FROMLONLAT",
+                    "0",
+                    "0"
+                ]
+            )
+            .await
+                == names(&[])
+        );
+    }
+
+    #[tokio::test]
+    async fn geo_missing_keys_and_members() {
+        let storage = Arc::new(DashMap::new());
+        assert!(
+            run(&storage, &["GEOPOS", "nokey", "a", "b"]).await
+                == RedisValueRef::Array(vec![RedisValueRef::NullArray, RedisValueRef::NullArray])
+        );
+        assert!(
+            run(&storage, &["GEODIST", "nokey", "a", "b"]).await == RedisValueRef::NullBulkString
+        );
+        assert!(
+            run(
+                &storage,
+                &[
+                    "GEOSEARCH",
+                    "nokey",
+                    "FROMLONLAT",
+                    "0",
+                    "0",
+                    "BYRADIUS",
+                    "1",
+                    "m"
+                ]
+            )
+            .await
+                == RedisValueRef::Array(vec![])
+        );
+        run(&storage, &["GEOADD", "g", "1", "2", "a"]).await;
+        assert!(run(&storage, &["GEODIST", "g", "a", "b"]).await == RedisValueRef::NullBulkString);
+        assert!(run(&storage, &["GEODIST", "g", "a", "a"]).await == reply_bulk("0.0000"));
+    }
+
+    #[tokio::test]
+    async fn geo_errors_match_redis() {
+        let storage = Arc::new(DashMap::new());
+        let cases: &[(&[&str], &str)] = &[
+            (
+                &["GEOADD", "g", "1", "2"],
+                "ERR wrong number of arguments for 'geoadd' command",
+            ),
+            (&["GEOADD", "g", "1", "2", "3", "4"], "ERR syntax error"),
+            (
+                &["GEOADD", "g", "200", "100", "x"],
+                "ERR invalid longitude,latitude pair 200.000000,100.000000",
+            ),
+            (
+                &["GEOADD", "g", "abc", "1", "x"],
+                "ERR value is not a valid float",
+            ),
+            (
+                &["GEOPOS"],
+                "ERR wrong number of arguments for 'geopos' command",
+            ),
+            (
+                &["GEODIST", "g", "a"],
+                "ERR wrong number of arguments for 'geodist' command",
+            ),
+            (
+                &["GEODIST", "g", "a", "b", "yd"],
+                "ERR unsupported unit provided. please use M, KM, FT, MI",
+            ),
+            (&["GEODIST", "g", "a", "b", "km", "x"], "ERR syntax error"),
+            (
+                &["GEOSEARCH", "g", "FROMLONLAT", "0", "0"],
+                "ERR wrong number of arguments for 'geosearch' command",
+            ),
+            (
+                &[
+                    "GEOSEARCH",
+                    "g",
+                    "FROMLONLAT",
+                    "0",
+                    "0",
+                    "BYRADIUS",
+                    "abc",
+                    "m",
+                ],
+                "ERR need numeric radius",
+            ),
+            (
+                &[
+                    "GEOSEARCH",
+                    "g",
+                    "FROMLONLAT",
+                    "0",
+                    "0",
+                    "BYRADIUS",
+                    "-1",
+                    "m",
+                ],
+                "ERR radius cannot be negative",
+            ),
+            (
+                &[
+                    "GEOSEARCH",
+                    "g",
+                    "FROMLONLAT",
+                    "0",
+                    "0",
+                    "BYRADIUS",
+                    "1",
+                    "yd",
+                ],
+                "ERR unsupported unit provided. please use M, KM, FT, MI",
+            ),
+            (
+                &[
+                    "GEOSEARCH",
+                    "g",
+                    "FROMLONLAT",
+                    "200",
+                    "0",
+                    "BYRADIUS",
+                    "1",
+                    "m",
+                ],
+                "ERR invalid longitude,latitude pair 200.000000,0.000000",
+            ),
+            (
+                &["GEOSEARCH", "g", "BYRADIUS", "1", "m", "ASC", "ASC"],
+                "ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH",
+            ),
+            (
+                &["geosearch", "g", "FROMLONLAT", "0", "0", "ASC", "ASC"],
+                "ERR exactly one of BYRADIUS and BYBOX can be specified for geosearch",
+            ),
+            (
+                &[
+                    "GEOSEARCH",
+                    "g",
+                    "FROMLONLAT",
+                    "0",
+                    "0",
+                    "BYRADIUS",
+                    "1",
+                    "m",
+                    "WITHDIST",
+                ],
+                "ERR syntax error",
+            ),
+            (
+                &["GEOSEARCH", "g", "FROMMEMBER", "a", "BYRADIUS", "1", "m"],
+                "ERR syntax error",
+            ),
+            (
+                &[
+                    "GEOSEARCH",
+                    "g",
+                    "FROMLONLAT",
+                    "0",
+                    "0",
+                    "BYBOX",
+                    "1",
+                    "1",
+                    "m",
+                ],
+                "ERR syntax error",
+            ),
+            (
+                &[
+                    "GEOSEARCH",
+                    "g",
+                    "FROMLONLAT",
+                    "0",
+                    "0",
+                    "BYRADIUS",
+                    "1",
+                    "m",
+                    "COUNT",
+                    "1",
+                ],
+                "ERR syntax error",
+            ),
+        ];
+        for (args, want) in cases {
+            assert!(run(&storage, args).await == reply_err(want), "{args:?}");
+        }
+
+        run(&storage, &["SET", "s", "v"]).await;
+        let wrongtype = reply_err("WRONGTYPE Operation against a key holding wrong type value");
+        assert!(run(&storage, &["GEOADD", "s", "1", "2", "a"]).await == wrongtype);
+        assert!(run(&storage, &["GEOPOS", "s", "a"]).await == wrongtype);
+        assert!(run(&storage, &["GEODIST", "s", "a", "b"]).await == wrongtype);
+        assert!(
+            run(
+                &storage,
+                &[
+                    "GEOSEARCH",
+                    "s",
+                    "FROMLONLAT",
+                    "0",
+                    "0",
+                    "BYRADIUS",
+                    "1",
+                    "zz"
+                ]
+            )
+            .await
+                == wrongtype
+        );
+    }
+
+    #[tokio::test]
+    async fn geoadd_adds_nothing_when_a_later_pair_is_invalid() {
+        let storage = Arc::new(DashMap::new());
+        let reply = run(
+            &storage,
+            &["GEOADD", "g", "1", "2", "a", "3", "4", "b", "181", "0", "c"],
+        )
+        .await;
+        assert!(reply == reply_err("ERR invalid longitude,latitude pair 181.000000,0.000000"));
+        assert!(storage.get(&Bytes::from_static(b"g")).is_none());
     }
 }

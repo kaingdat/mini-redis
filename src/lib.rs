@@ -1,5 +1,6 @@
 pub mod aof;
 pub mod command;
+pub mod geo;
 pub mod pubsub;
 pub mod rdb;
 pub mod replication;

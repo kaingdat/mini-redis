@@ -80,6 +80,16 @@ impl SortedSetData {
         }
     }
 
+    pub fn range_by_score(
+        &self,
+        min: f64,
+        max_exclusive: f64,
+    ) -> impl Iterator<Item = (&Bytes, f64)> {
+        self.list
+            .iter_from_score(min)
+            .take_while(move |&(_, score)| score < max_exclusive)
+    }
+
     pub fn range(&self, start: i64, stop: i64) -> Vec<Bytes> {
         let len = self.list.len() as i64;
         if len == 0 {

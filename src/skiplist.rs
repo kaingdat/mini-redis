@@ -224,6 +224,25 @@ impl SkipList {
         }
     }
 
+    pub fn iter_from_score(&self, score: f64) -> Iter<'_> {
+        let mut x = HEAD;
+        for i in (0..self.level).rev() {
+            loop {
+                let link = self.links[x as usize + i];
+                if link.next != NIL && link.score < score {
+                    x = link.next;
+                } else {
+                    break;
+                }
+            }
+        }
+        let first = self.links[x as usize];
+        Iter {
+            list: self,
+            cur: if first.next == NIL { NIL } else { first.key },
+        }
+    }
+
     fn key_at(&self, rank: usize) -> u32 {
         if rank >= self.len {
             return NIL;
@@ -489,6 +508,28 @@ mod tests {
     }
 
     #[test]
+    fn iter_from_score_starts_at_the_first_score_not_below() {
+        let mut list = SkipList::with_seed(6);
+        assert_eq!(list.iter_from_score(1.0).next(), None);
+        for (score, m) in [(1.0, "b"), (1.0, "a"), (2.0, "c"), (4.0, "d")] {
+            list.insert(score, b(m));
+        }
+        let from = |score: f64| -> Vec<Bytes> {
+            list.iter_from_score(score)
+                .map(|(m, _)| m.clone())
+                .collect()
+        };
+        assert_eq!(
+            from(f64::NEG_INFINITY),
+            vec![b("a"), b("b"), b("c"), b("d")]
+        );
+        assert_eq!(from(1.0), vec![b("a"), b("b"), b("c"), b("d")]);
+        assert_eq!(from(1.5), vec![b("c"), b("d")]);
+        assert_eq!(from(4.0), vec![b("d")]);
+        assert!(from(4.5).is_empty());
+    }
+
+    #[test]
     fn matches_a_sorted_vec() {
         let scores = [
             -2.5,
@@ -543,6 +584,19 @@ mod tests {
                             assert_eq!(g.1, w.1);
                             assert_eq!(g.0.to_bits(), w.0.to_bits());
                         }
+                        let min = scores[rng.random_range(0..scores.len())];
+                        let got: Vec<_> = list
+                            .iter_from_score(min)
+                            .take(3)
+                            .map(|(m, _)| m.clone())
+                            .collect();
+                        let want: Vec<_> = model
+                            .iter()
+                            .filter(|(s, _)| *s >= min)
+                            .take(3)
+                            .map(|(_, m)| m.clone())
+                            .collect();
+                        assert_eq!(got, want);
                     }
                 }
                 assert_eq!(list.len(), model.len());
