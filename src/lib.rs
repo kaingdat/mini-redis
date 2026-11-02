@@ -6,6 +6,7 @@ pub mod replication;
 pub mod resp;
 pub mod server;
 pub mod session;
+pub mod skiplist;
 pub mod stream;
 pub mod transaction;
 pub mod types;

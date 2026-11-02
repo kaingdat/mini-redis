@@ -1,9 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use bytes::Bytes;
 use tokio::time::Instant;
 
-use crate::stream::StreamData;
+use crate::{skiplist::SkipList, stream::StreamData};
 
 #[derive(Clone)]
 pub enum RedisValue {
@@ -27,39 +27,32 @@ impl ValueEntry {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SortedSetData {
     members: HashMap<Bytes, f64>,
-    scores: BTreeSet<OrderedScore>,
-}
-
-impl Default for SortedSetData {
-    fn default() -> Self {
-        Self::new()
-    }
+    list: SkipList,
 }
 
 impl SortedSetData {
     pub fn new() -> Self {
-        Self {
-            members: HashMap::new(),
-            scores: BTreeSet::new(),
-        }
+        Self::default()
     }
 
     pub fn add(&mut self, member: Bytes, score: f64) -> bool {
-        if let Some(&old_score) = self.members.get(&member) {
-            if old_score != score {
-                self.scores
-                    .remove(&OrderedScore::new(old_score, member.clone()));
-                self.scores.insert(OrderedScore::new(score, member.clone()));
-                self.members.insert(member, score);
+        match self.members.get(&member) {
+            Some(&old) => {
+                if old != score {
+                    self.list.remove(old, &member);
+                    self.list.insert(score, member.clone());
+                    self.members.insert(member, score);
+                }
+                false
             }
-            false
-        } else {
-            self.scores.insert(OrderedScore::new(score, member.clone()));
-            self.members.insert(member, score);
-            true
+            None => {
+                self.list.insert(score, member.clone());
+                self.members.insert(member, score);
+                true
+            }
         }
     }
 
@@ -72,9 +65,8 @@ impl SortedSetData {
     }
 
     pub fn rank(&self, member: &Bytes) -> Option<i64> {
-        let score = self.members.get(member)?;
-        let target = OrderedScore::new(*score, member.clone());
-        Some(self.scores.range(..target).count() as i64)
+        let score = *self.members.get(member)?;
+        self.list.rank(score, member).map(|r| r as i64)
     }
 
     pub fn score(&self, member: &Bytes) -> Option<f64> {
@@ -82,69 +74,28 @@ impl SortedSetData {
     }
 
     pub fn remove(&mut self, member: &Bytes) -> bool {
-        if let Some(&score) = self.members.get(member) {
-            self.scores
-                .remove(&OrderedScore::new(score, member.clone()));
-            self.members.remove(member);
-            true
-        } else {
-            false
+        match self.members.remove(member) {
+            Some(score) => self.list.remove(score, member),
+            None => false,
         }
     }
 
     pub fn range(&self, start: i64, stop: i64) -> Vec<Bytes> {
-        let len = self.scores.len() as i64;
+        let len = self.list.len() as i64;
         if len == 0 {
             return vec![];
         }
         let resolve = |idx: i64| -> i64 { if idx < 0 { (len + idx).max(0) } else { idx } };
-        let start = resolve(start) as usize;
-        let stop = resolve(stop).min(len - 1) as usize;
-        if start as i64 >= len {
+        let start = resolve(start);
+        let stop = resolve(stop).min(len - 1);
+        if start >= len || start > stop {
             return vec![];
         }
-        if start > stop {
-            return vec![];
-        }
-        self.scores
-            .iter()
-            .skip(start)
-            .take(stop - start + 1)
-            .map(|e| e.member.clone())
+        self.list
+            .iter_from(start as usize)
+            .take((stop - start + 1) as usize)
+            .map(|(m, _)| m.clone())
             .collect()
-    }
-}
-
-#[derive(PartialEq, Eq, Clone)]
-pub struct OrderedScore {
-    score_bits: u64,
-    member: Bytes,
-}
-
-impl OrderedScore {
-    pub fn new(score: f64, member: Bytes) -> Self {
-        let bits = score.to_bits();
-        let score_bits = if (bits >> 63) == 0 {
-            bits ^ 0x8000_0000_0000_0000
-        } else {
-            !bits
-        };
-        Self { score_bits, member }
-    }
-}
-
-impl PartialOrd for OrderedScore {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OrderedScore {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.score_bits.cmp(&other.score_bits) {
-            std::cmp::Ordering::Equal => self.member.cmp(&other.member),
-            other => other,
-        }
     }
 }
 
@@ -157,27 +108,45 @@ mod tests {
         let mut zset = SortedSetData::new();
         assert!(zset.add(Bytes::from("member1"), 1.0));
         assert_eq!(zset.len(), 1);
-        assert!(!zset.add(Bytes::from("member1"), 2.0)); // update
+        assert!(!zset.add(Bytes::from("member1"), 2.0));
         assert_eq!(zset.len(), 1);
     }
 
     #[test]
-    fn test_ordered_score_sorting() {
-        let s1 = OrderedScore::new(1.0, Bytes::from("a"));
-        let s2 = OrderedScore::new(2.0, Bytes::from("b"));
-        let s3 = OrderedScore::new(-1.0, Bytes::from("c"));
-
-        assert!(s3 < s1); // -1 < 1
-        assert!(s1 < s2); // 1 < 2
+    fn rank_and_range_follow_score_then_member() {
+        let mut zset = SortedSetData::new();
+        for (m, score) in [("c", 2.0), ("a", 1.0), ("b", 1.0), ("d", -1.0)] {
+            zset.add(Bytes::from(m), score);
+        }
+        assert_eq!(zset.rank(&Bytes::from("d")), Some(0));
+        assert_eq!(zset.rank(&Bytes::from("b")), Some(2));
+        assert_eq!(zset.range(-2, -1), vec![Bytes::from("b"), Bytes::from("c")]);
+        assert_eq!(
+            zset.range(1, 100),
+            vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]
+        );
+        assert!(zset.range(3, 1).is_empty());
+        assert!(zset.range(4, 10).is_empty());
     }
 
     #[test]
-    fn test_lexicographic_tiebreak() {
-        let s1 = OrderedScore::new(1.0, Bytes::from("apple"));
-        let s2 = OrderedScore::new(1.0, Bytes::from("banana"));
-        let s3 = OrderedScore::new(1.0, Bytes::from("cherry"));
+    fn updating_a_score_moves_the_member() {
+        let mut zset = SortedSetData::new();
+        zset.add(Bytes::from("a"), 1.0);
+        zset.add(Bytes::from("b"), 2.0);
+        zset.add(Bytes::from("a"), 3.0);
+        assert_eq!(zset.rank(&Bytes::from("a")), Some(1));
+        assert_eq!(zset.score(&Bytes::from("a")), Some(3.0));
+        assert!(zset.remove(&Bytes::from("a")));
+        assert!(!zset.remove(&Bytes::from("a")));
+        assert_eq!(zset.range(0, -1), vec![Bytes::from("b")]);
+    }
 
-        assert!(s1 < s2);
-        assert!(s2 < s3);
+    #[test]
+    fn negative_zero_ties_with_zero_and_orders_by_member() {
+        let mut zset = SortedSetData::new();
+        zset.add(Bytes::from("a"), 0.0);
+        zset.add(Bytes::from("b"), -0.0);
+        assert_eq!(zset.range(0, -1), vec![Bytes::from("a"), Bytes::from("b")]);
     }
 }
