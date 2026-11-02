@@ -123,9 +123,7 @@ impl Transaction {
                 ok()
             }
             (Some(Control::Watch), _) if arity(value) < 2 => wrong_arity("watch"),
-            (Some(Control::Watch), Some(_)) => {
-                error(b"ERR WATCH inside MULTI is not allowed")
-            }
+            (Some(Control::Watch), Some(_)) => error(b"ERR WATCH inside MULTI is not allowed"),
             (Some(Control::Watch), None) => {
                 let RedisValueRef::Array(parts) = value else {
                     unreachable!("control() only matches arrays")

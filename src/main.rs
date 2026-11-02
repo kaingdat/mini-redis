@@ -7,8 +7,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 #[rustfmt::skip]
-use codecrafters_redis::prelude::*;
-use codecrafters_redis::types::RedisValueRef;
+use mini_redis::prelude::*;
+use mini_redis::types::RedisValueRef;
 
 #[tokio::main]
 async fn main() {

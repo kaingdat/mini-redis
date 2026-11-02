@@ -1,8 +1,8 @@
 use std::hint::black_box;
 
 use bytes::Bytes;
-use codecrafters_redis::value::SortedSetData;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use mini_redis::value::SortedSetData;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 const SIZES: [usize; 3] = [1_000, 100_000, 1_000_000];

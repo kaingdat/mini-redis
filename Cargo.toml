@@ -1,7 +1,6 @@
 [package]
-name = "codecrafters-redis"
+name = "mini-redis"
 version = "0.1.0"
-authors = ["Codecrafters <hello@codecrafters.io>"]
 edition = "2024"
 
 [lints.clippy]

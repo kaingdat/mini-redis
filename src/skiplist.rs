@@ -132,8 +132,8 @@ impl SkipList {
             };
             self.links[base as usize + i] = moved;
         }
-        for i in height..self.level {
-            self.links[update[i] as usize + i].span += 1;
+        for (i, &node) in update.iter().enumerate().take(self.level).skip(height) {
+            self.links[node as usize + i].span += 1;
         }
 
         match self.links[base as usize] {
